@@ -297,7 +297,7 @@ def build_s3_put_headers(upload_url: str, region: str, access_key: str,
 
 # ==========================================================================
 # Verify Import + Geocode/Hazard/Analysis pipeline
-# Ported from modRMSImport.bas (confirmed-working VBA).
+# Ported from modRMSImport.bas + modLocationsHazard.bas (confirmed-working VBA).
 # ==========================================================================
 
 TIMEOUT_CONNECT = 30
@@ -306,9 +306,35 @@ VERIFY_MAX_RETRIES = 3
 PAGE_LIMIT = 1000
 
 
+def safe_get(obj, key):
+    """Case-insensitive-ish dict getter mirroring the VBA's LH_SafeGet,
+    simplified for the one use here (reading accountId)."""
+    if not isinstance(obj, dict):
+        return None
+    return obj.get(key)
+
+
+def find_max_account_id(all_locations):
+    """Ported from LH_PullLocationsAndHazardsForAccount's maxAcct loop:
+    scans every location wrapper's location.property.accountId and
+    returns the highest numeric value found (or None if none are numeric)."""
+    max_acct = None
+    for lw in all_locations:
+        location = (lw or {}).get("location") or {}
+        prop = location.get("property") or {}
+        acct_id = safe_get(prop, "accountId")
+        try:
+            acct_id_f = float(acct_id)
+        except (TypeError, ValueError):
+            continue
+        if max_acct is None or acct_id_f > max_acct:
+            max_acct = acct_id_f
+    return max_acct
+
+
 class ImportVerifier:
     """Thin wrapper around the confirmed GET /exposures/{id}/locations
-    (and /portfolios/{id}/locations) endpoints, used purely for counting."""
+    endpoint, used purely for counting the just-imported batch."""
 
     def __init__(self, host: str, api_key: str, verify: bool = True):
         self.host = host.strip()
@@ -343,45 +369,67 @@ class ImportVerifier:
         except (ValueError, TypeError):
             return None
 
-    def count_locations(self, exposure_id: str, portfolio_id: str = "") -> tuple[int, str]:
-        """Returns (count, error_message). error_message is '' on success.
-        Paginates through every location for the exposure (optionally
-        scoped to a portfolio, if the tenant's API surface supports that
-        path) and returns the total count actually present in RMS."""
-        if portfolio_id:
-            base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/portfolios/{portfolio_id}/locations"
-        else:
-            base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/locations"
-
-        total = 0
+    def fetch_all_locations(self, exposure_id: str) -> tuple[list, str]:
+        """Returns (list_of_location_wrappers, error_message_or_empty).
+        Paginates GET /exposures/{id}/locations exactly as the confirmed
+        macro does - NO portfolio scoping in the URL."""
+        base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/locations"
+        all_locations = []
         offset = 0
         while True:
             status, text = self._get(f"{base}?limit={PAGE_LIMIT}&offset={offset}")
             if status != 200:
                 if offset == 0:
-                    return 0, f"HTTP {status}: {text[:300]}"
-                break  # partial results already counted - stop paginating
+                    return [], f"HTTP {status}: {text[:300]}"
+                break  # partial results already gathered - stop paginating
             parsed = self._safe_json(text)
-            items = parsed if isinstance(parsed, list) else (
-                parsed.get("locations") or parsed.get("items") or parsed.get("data") or []
-                if isinstance(parsed, dict) else []
-            )
+            items = parsed if isinstance(parsed, list) else []
             if not items:
                 break
-            total += len(items)
+            all_locations.extend(items)
             if len(items) < PAGE_LIMIT:
                 break
             offset += PAGE_LIMIT
             if offset > 500000:
                 break
-        return total, ""
+        return all_locations, ""
+
+    def count_locations_for_latest_submission(self, exposure_id: str) -> tuple[int, str]:
+        """Returns (count, error_message). error_message is '' on success.
+        Counts only the locations belonging to the highest accountId
+        present under this exposure - i.e. the just-imported batch."""
+        all_locations, error = self.fetch_all_locations(exposure_id)
+        if error:
+            return 0, error
+        if not all_locations:
+            return 0, ""
+
+        max_acct = find_max_account_id(all_locations)
+        if max_acct is None:
+            # No location carried a numeric accountId at all - fall back
+            # to counting everything, since we can't distinguish batches.
+            return len(all_locations), ""
+
+        count = 0
+        for lw in all_locations:
+            location = (lw or {}).get("location") or {}
+            prop = location.get("property") or {}
+            acct_id = safe_get(prop, "accountId")
+            try:
+                if float(acct_id) == max_acct:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+        return count, ""
 
 
 def verify_location_count(verifier: ImportVerifier, exposure_id: str, portfolio_id: str,
                            expected_count: int) -> dict:
     """Returns a result dict with keys: expected, actual, match, error,
-    message - ready to render directly in a Streamlit UI."""
-    actual_count, error = verifier.count_locations(exposure_id, portfolio_id)
+    message - ready to render directly in a Streamlit UI. portfolio_id is
+    accepted for display/logging only - it is NOT used to scope the
+    query, since no confirmed portfolio-scoped locations endpoint exists."""
+    actual_count, error = verifier.count_locations_for_latest_submission(exposure_id)
     if error:
         return {
             "expected": expected_count, "actual": None, "match": False, "error": error,
@@ -398,7 +446,7 @@ def verify_location_count(verifier: ImportVerifier, exposure_id: str, portfolio_
     else:
         extra = actual_count - expected_count
         message = (f"⚠️ RMS reports {actual_count} location(s), {extra} MORE than the "
-                    f"{expected_count} submitted - this portfolio may already have contained "
+                    f"{expected_count} submitted - this account may already have contained "
                     f"locations from a prior import.")
     return {
         "expected": expected_count, "actual": actual_count, "match": match,
@@ -414,25 +462,20 @@ TERMINAL_STATUSES = {"FINISHED", "SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED"
 SUCCESS_STATUSES = {"FINISHED", "SUCCEEDED", "COMPLETED"}
 
 # Live confirmed defaults, pulled directly from the source workbook's
-# Controls!K1:M9 settings block (NOT guessed) - shown as starting values
-# in the UI, editable per the macro's own "confirm which ID you actually
-# want" guidance.
+# Controls!K1:M9 settings block.
 CONFIRMED_DEFAULTS = {
     "model_profile_id": 1256,
     "event_rate_scheme_id": 163,
     "vintage": "RL24",
     "output_profile_id": 11,
     "currency": "USD",
-    "geohaz_engine_version": "25.0",  # Format$(25, "0.0") - RMS rejects a bare "25"
+    "geohaz_engine_version": "25.0",
     "geohaz_engine_type": "RL",
     "hazard_layer_name": "earthquake",
 }
 
 
 class RmsAnalysisApi:
-    """Wraps the geocode/hazard/analysis job submission + polling endpoints.
-    Shares the same host/key/resource-group pattern as RmsImportApi."""
-
     def __init__(self, host: str, api_key: str, verify: bool = True):
         self.host = host.strip()
         self.session = requests.Session()
@@ -513,10 +556,6 @@ class RmsAnalysisApi:
 
     @staticmethod
     def _extract_job_id(status, text, headers):
-        """Common id-extraction logic used by all three job submissions:
-        try id/jobId/workflowId in the body first, then fall back to the
-        Location header's last path segment (confirmed pattern from the
-        VBA, used when RMS returns an empty 201 body)."""
         if not (200 <= status < 300):
             return ""
         job_id = ""
@@ -529,11 +568,8 @@ class RmsAnalysisApi:
                 job_id = location.rstrip("/").split("/")[-1]
         return job_id
 
-    # ---- Stage 1: Geocode job ----
-
     def submit_geocode_job(self, edm_name: str, portfolio_id: str, engine_type: str,
                             engine_version: str, skip_prev_geocoded: bool) -> tuple[str, str]:
-        """Returns (job_id, raw_response_text)."""
         url = f"https://{self.host}/riskmodeler/v1/portfolios/{portfolio_id}/geohaz?datasource={edm_name}"
         body = json.dumps([{
             "name": "geocode", "type": "geocode",
@@ -548,8 +584,6 @@ class RmsAnalysisApi:
         status, text, headers = self._post(url, body, extra_headers=extra_headers)
         return self._extract_job_id(status, text, headers), text
 
-    # ---- Stage 2: Hazard job ----
-
     def submit_hazard_job(self, edm_name: str, portfolio_id: str, hazard_layer_name: str,
                            engine_type: str, engine_version: str) -> tuple[str, str]:
         url = f"https://{self.host}/riskmodeler/v1/portfolios/{portfolio_id}/geohaz?datasource={edm_name}"
@@ -562,8 +596,6 @@ class RmsAnalysisApi:
         extra_headers = {"x-rms-resource-group-id": resource_group_id} if resource_group_id else None
         status, text, headers = self._post(url, body, extra_headers=extra_headers)
         return self._extract_job_id(status, text, headers), text
-
-    # ---- Stage 3: Analysis job ----
 
     def submit_analysis_job(self, edm_name: str, portfolio_id: str, model_profile_id: int,
                              event_rate_scheme_id: int, output_profile_id: int,
@@ -584,11 +616,7 @@ class RmsAnalysisApi:
         status, text, headers = self._post(url, body, extra_headers=extra_headers)
         return self._extract_job_id(status, text, headers), text
 
-    # ---- Status polling (shared logic, different candidate URL sets) ----
-
     def _check_status_once(self, job_id: str, candidates: list, cached_status_url: str = ""):
-        """Returns (status_string, status_url_used, raw_text). Status is
-        'UNKNOWN' if no candidate URL responds 200."""
         status_url = cached_status_url
         if not status_url:
             for candidate in candidates:
@@ -614,7 +642,6 @@ class RmsAnalysisApi:
         return self._check_status_once(job_id, candidates, cached_status_url)
 
     def check_hazard_status(self, job_id: str, cached_status_url: str = ""):
-        # Same candidate set as geocode - both are geohaz-layer jobs.
         return self.check_geocode_status(job_id, cached_status_url)
 
     def check_analysis_status(self, job_id: str, cached_status_url: str = ""):
@@ -1783,7 +1810,12 @@ else:
         # ---- Stage A: Verify location count ----
         st.markdown("#### A. Verify location count")
         expected_count = len(st.session_state.get("loc_df", pd.DataFrame()))
-        st.caption(f"Expected: {expected_count} location(s), based on the LOC file built in step 3.")
+        st.caption(
+            f"Expected: {expected_count} location(s), based on the LOC file built in step 3. "
+            f"Verification pulls every location under this exposure and counts the most recent "
+            f"(highest account ID) submission - there is no portfolio-scoped locations endpoint "
+            f"in RMS, so this mirrors the confirmed macro's own filtering approach."
+        )
 
         if st.button("🔎 Verify locations imported"):
             verifier = ImportVerifier(job_info["host"], job_info["api_key"], verify=job_info["verify_ssl"])
@@ -1849,7 +1881,6 @@ else:
                     pipeline_status.write(msg)
 
                 try:
-                    # --- Geocode ---
                     pipeline_status.update(label="Stage 1/3: Submitting geocode job...")
                     geo_job_id, geo_raw = analysis_api.submit_geocode_job(
                         edm_name_for_analysis, portfolio_id, geohaz_engine_type,
@@ -1875,7 +1906,6 @@ else:
                         else:
                             plog(f"✅ Geocode phase succeeded ({geo_status})")
 
-                            # --- Hazard ---
                             pipeline_status.update(label="Stage 2/3: Submitting hazard job...")
                             haz_job_id, haz_raw = analysis_api.submit_hazard_job(
                                 edm_name_for_analysis, portfolio_id, hazard_layer_name,
@@ -1901,7 +1931,6 @@ else:
                                 else:
                                     plog(f"✅ Hazard phase succeeded ({haz_status})")
 
-                                    # --- Analysis ---
                                     pipeline_status.update(label="Stage 3/3: Submitting analysis job...")
                                     an_job_id, an_raw = analysis_api.submit_analysis_job(
                                         edm_name_for_analysis, portfolio_id,
