@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-RMS LOC/ACC File Builder (Streamlit)
+RMS LOC/ACC File Builder (Streamlit) - v2
 
 Ports the "Data" tab + its live formulas (LOC/ACC sheets) + Geocode_DataTab.bas
 macro from a confirmed-working RMS cleansing workbook into a single Streamlit
@@ -9,32 +9,46 @@ data-entry app. Produces RMS-import-ready ACC and LOC CSV files.
 Workflow:
   1. Enter Account Information (one record - mirrors Data!A2:N3).
   2. Enter one or more Locations (mirrors Data!B11:AV11 input columns).
-  3. Geocode all locations (POST /li/geocode/latest, flat body - confirmed
-     shape from Geocode_DataTab.bas) -> Latitude, Longitude, Resolution
-     Code/Type, State Helper (admin1Code), County Helper (admin2Name),
-     CRESTA Helper (zone1Code).
-  4. Build the ACC (29-column) and LOC (58-column) tables using the exact
-     field mapping and dropdown->code lookups read directly out of the
-     workbook's "Schemas" sheet and the live LOC/ACC sheet formulas.
-  5. Export ACC_*.csv and LOC_*.csv, named/formatted to match
-     ExportLocAccToCSV in modRMSImport.bas.
+  3. Click "Geocode & Build ACC/LOC Files" - a SINGLE combined action that
+     geocodes every location and builds the ACC/LOC tables in one pass.
+
+ARCHITECTURE NOTE - v2 fix for a real bug found in v1
+------------------------------------------------------
+v1 tried to write geocode results (Latitude, Longitude, State/County/CRESTA)
+back INTO the same st.data_editor used for location input, across a
+separate button click and page rerun. This relies on Streamlit correctly
+re-adopting a changed `data` argument for an existing widget `key` -  which,
+in practice (especially with num_rows="dynamic" editors), does not reliably
+sync on every Streamlit version, and/or the "geocoded OK" counter was only
+checking the HTTP status rather than confirming usable coordinates were
+actually present in the response. Both of these could silently leave
+Latitude/Longitude blank even after a reported "Geocoded 1/1" success.
+
+v2 removes the round-trip entirely:
+  - The location editor ONLY ever holds the fields the user types. It never
+    displays or stores geocode outputs.
+  - Geocoding and file-building happen in ONE button handler, in ONE script
+    run, operating on the data_editor's just-returned value as a plain
+    local Python variable (not session_state) - so there is no cross-run
+    synchronization to get wrong.
+  - A row only counts as successfully geocoded if the response contains a
+    non-null, non-zero latitude AND longitude - not merely HTTP 200.
+  - Geocode results are shown in a separate, read-only preview table built
+    fresh every time the combined action runs.
 
 Known issues in the SOURCE WORKBOOK this app intentionally does NOT
 reproduce (fixed here instead):
   - LOC!T2 (YEARBUILT) and LOC!AS2 (YEARUPGRAD) build a string
-    "01/01/"&year. A prior confirmed requirement is that RMS needs these
-    as PLAIN 4-DIGIT YEAR INTEGERS, not dates - this app outputs the bare
-    year.
+    "01/01/"&year. RMS needs these as PLAIN 4-DIGIT YEAR INTEGERS, not
+    dates - this app outputs the bare year.
   - ACC!Y2 (BLANDEDCUR) contains a broken #REF! formula from a deleted
     column - this app outputs an empty value for that field instead.
   - LOC Latitude/Longitude/ADDRMATCH/Resolution Type columns have no
-    formula at all in the live sheet (an apparent gap) - this app
-    correctly populates them from the geocode step, which is clearly the
-    columns' intended purpose.
+    formula at all in the live sheet - this app populates them from the
+    geocode step, which is clearly the columns' intended purpose.
 """
 
 import io
-import json
 import time
 from datetime import date, datetime
 
@@ -45,11 +59,10 @@ from requests.adapters import HTTPAdapter
 
 TIMEOUT = 60
 MAX_RETRIES = 4
+LARGE_NUMBER_MAX = 999_999_999_999  # effectively unbounded for insurance values (up to ~$1 trillion)
 
 # --------------------------------------------------------------------------
 # Reference data - extracted directly from the workbook's "Schemas" sheet.
-# Each is a list of (code, description) pairs; the Streamlit dropdowns show
-# the description, and the matching code is written to the LOC file.
 # --------------------------------------------------------------------------
 
 US_STATES = [
@@ -67,7 +80,6 @@ US_STATES = [
 ]
 STATE_CODE_TO_NAME = {c: n for c, n in US_STATES}
 STATE_NAME_TO_CODE = {n.upper(): c for c, n in US_STATES}
-STATE_CODE_SET = {c for c, _ in US_STATES}
 
 CONSTRUCTION = [
     (0,"ATC 0 - Unknown"),(1,"ATC 1 - Wood Frame"),(2,"ATC 2 - Light Metal"),
@@ -133,13 +145,6 @@ def desc_to_code(pairs, description):
     return ""
 
 
-def code_to_desc(pairs, code):
-    for c, desc in pairs:
-        if c == code:
-            return desc
-    return ""
-
-
 def options_list(pairs):
     return [desc for _, desc in pairs]
 
@@ -166,8 +171,9 @@ class GeocodeApi:
 
     def geocode(self, street, city, county, state_input, postal, version="latest"):
         """Resolves state_input (either a 2-letter code or full name) into
-        BOTH admin1Code and admin1Name, exactly as Geocode_DataTab.bas does
-        via its Schemas A:B two-block lookup, then sends a flat body."""
+        BOTH admin1Code and admin1Name, exactly as Geocode_DataTab.bas does,
+        then sends a flat body. Returns (payload_dict_or_None, http_status,
+        error_detail_or_None)."""
         state_input = (state_input or "").strip()
         admin1_code, admin1_name = "", ""
         if state_input:
@@ -223,7 +229,12 @@ class GeocodeApi:
 
 
 # --------------------------------------------------------------------------
-# Default per-location field set (mirrors Data!B11:AV11 input columns)
+# Default per-location field set (mirrors Data!B11:AV11 input columns).
+# NOTE: geocode OUTPUT fields (Latitude, Longitude, Resolution Code/Type,
+# State/County/CRESTA helpers) are intentionally NOT included here anymore -
+# they are computed fresh every time the combined Geocode & Build action
+# runs, and shown in a separate read-only preview table. This is the core
+# v2 fix: the editable table never needs to "receive back" computed data.
 # --------------------------------------------------------------------------
 
 LOCATION_INPUT_DEFAULTS = {
@@ -244,10 +255,18 @@ LOCATION_INPUT_DEFAULTS = {
     "EQSL  Susceptibility": "Unknown (Average)",
     "Current Replacement Cost": 0, "Required Min $/sf": 0,
     "Min $/sf Flag": "", "Evaluated Building Value": 0,
-    # Geocode outputs (filled by the Geocode step, not typed by the user)
-    "Latitude": None, "Longitude": None, "Resolution Code": None, "Resolution Type": "",
-    "State Helper": "", "County Helper": "", "Cresta Zone Helper": "",
 }
+
+# Monetary / large-number fields that must accept big values without
+# truncation or silent clamping - addressed explicitly via NumberColumn
+# configs below (min_value=0, no max_value cap except a generous ceiling,
+# and a format that does not round or display in scientific notation).
+LARGE_NUMBER_FIELDS = [
+    "Building Value", "Contents", "BI", "Site Limit", "Site Deductible",
+    "Combined Limit", "Combined Deductible", "Buildings Deductible",
+    "Contents Deductible", "BI deductible", "Floor Area (SQ FT)",
+    "Current Replacement Cost", "Required Min $/sf", "Evaluated Building Value",
+]
 
 ACC_HEADERS = [
     "ACCNTNUM","ACCNTNAME","ACCNTSTAT","UWRITRNAME","BRANCHNAME","PRODID","CEDANTID",
@@ -281,17 +300,15 @@ def safe_num(v, default=0):
 
 def safe_year(v):
     """YEARBUILT / YEARUPGRAD must be a plain 4-digit year integer - NOT a
-    date string. This corrects a known formula bug in the source workbook
-    (LOC!T2 / LOC!AS2 built '01/01/'&year as text)."""
+    date string (corrects a known formula bug in the source workbook)."""
     n = safe_num(v, 0)
     return int(n) if n > 1752 else ""
 
 
 def build_acc_row(account):
     """Builds one ACC row dict, ported field-by-field from the live ACC
-    sheet formulas (ACC!A2:AC2), reading from the single Account
-    Information record. BLANDEDCUR is intentionally left blank - the
-    source workbook's ACC!Y2 formula contains a broken #REF! reference."""
+    sheet formulas (ACC!A2:AC2). BLANDEDCUR is intentionally left blank -
+    the source workbook's ACC!Y2 formula contains a broken #REF! reference."""
     row = {h: "" for h in ACC_HEADERS}
     account_key = str(account.get("Account Key", "")).strip()
 
@@ -319,9 +336,12 @@ def build_acc_row(account):
     return row
 
 
-def build_loc_row(account, loc, loc_number):
-    """Builds one LOC row dict, ported field-by-field from the live LOC
-    sheet formulas (LOC!A2:BF2)."""
+def build_loc_row(account, loc, loc_number, geocode_fields):
+    """Builds one LOC row dict. `loc` is the user's typed input fields for
+    this location; `geocode_fields` is a dict with Latitude, Longitude,
+    Resolution Code, Resolution Type, State Helper, County Helper, Cresta
+    Zone Helper - computed fresh in the SAME pass, never round-tripped
+    through the editor."""
     row = {h: "" for h in LOC_HEADERS}
     account_key = str(account.get("Account Key", "")).strip()
     if not account_key:
@@ -331,19 +351,15 @@ def build_loc_row(account, loc, loc_number):
     row["LOCNUM"] = loc_number
     row["STREETNAME"] = loc.get("STREETNAME", "")
     row["CITY"] = loc.get("CITY", "")
-    # COUNTY and CRESTA come from the GEOCODED helper columns, not the raw
-    # typed input - matching LOC!E2/F2 exactly.
-    row["COUNTY"] = loc.get("County Helper", "") or ""
-    row["CRESTA"] = loc.get("Cresta Zone Helper", "") or ""
-    row["STATECODE"] = loc.get("State Helper", "") or ""
+    row["COUNTY"] = geocode_fields.get("County Helper", "") or ""
+    row["CRESTA"] = geocode_fields.get("Cresta Zone Helper", "") or ""
+    row["STATECODE"] = geocode_fields.get("State Helper", "") or ""
     row["POSTALCODE"] = loc.get("ZIPCODE", "")
 
-    # Intentionally corrected vs. the source workbook: these ARE populated
-    # from the geocode step (the columns clearly exist for this purpose).
-    row["LATITUDE"] = loc.get("Latitude")
-    row["LONGITUDE"] = loc.get("Longitude")
-    row["ADDRMATCH"] = loc.get("Resolution Code")
-    row["Resolution Type"] = loc.get("Resolution Type", "")
+    row["LATITUDE"] = geocode_fields.get("Latitude")
+    row["LONGITUDE"] = geocode_fields.get("Longitude")
+    row["ADDRMATCH"] = geocode_fields.get("Resolution Code")
+    row["Resolution Type"] = geocode_fields.get("Resolution Type", "")
 
     row["CNTRYSCHEME"] = "ISO2A"
     row["CNTRYCODE"] = "US"
@@ -401,9 +417,77 @@ def build_loc_row(account, loc, loc_number):
     row["FRAMEBOLT"] = desc_to_code(FRAME_BOLTED, loc.get("Frame Bolted", ""))
     row["TILTUPRET"] = desc_to_code(ANCHORING, loc.get("Anchoring", ""))
     row["ENGFOUND"] = desc_to_code(ENGINEERED_FOUNDATION, loc.get("Engineered Foundation", ""))
-    row["User Defined 1"] = loc.get("Cresta Zone Helper", "") or ""
+    row["User Defined 1"] = geocode_fields.get("Cresta Zone Helper", "") or ""
 
     return row
+
+
+def geocode_and_build(api, account, locations_df):
+    """Single-pass pipeline: geocodes every location with a STREETNAME and
+    builds the matching LOC row immediately, using only local variables.
+    Returns (acc_df, loc_df, preview_rows, ok_count, total_count)."""
+    preview_rows = []
+    loc_rows = []
+    ok_count = 0
+    total_count = 0
+
+    for _, loc in locations_df.iterrows():
+        street = str(loc.get("STREETNAME", "")).strip()
+        if not street:
+            continue
+        total_count += 1
+        loc_dict = loc.to_dict()
+
+        payload, status, error = api.geocode(
+            street, loc_dict.get("CITY", ""), loc_dict.get("COUNTY", ""),
+            loc_dict.get("STATE", ""), loc_dict.get("ZIPCODE", ""),
+        )
+
+        geocode_fields = {
+            "Latitude": None, "Longitude": None, "Resolution Code": None,
+            "Resolution Type": "", "State Helper": "", "County Helper": "", "Cresta Zone Helper": "",
+        }
+
+        lat = lon = None
+        if status == 200 and isinstance(payload, dict):
+            lat = payload.get("latitude")
+            lon = payload.get("longitude")
+
+        # A row only counts as successfully geocoded if BOTH coordinates
+        # are present and non-null - matching HTTP 200 alone is NOT enough
+        # (this was the root cause of v1's "Geocoded 1/1 but still blank"
+        # bug: it counted success on status code only).
+        if status == 200 and lat is not None and lon is not None:
+            res_code = payload.get("rmsGeoModelResolutionCode")
+            geocode_fields["Latitude"] = lat
+            geocode_fields["Longitude"] = lon
+            geocode_fields["Resolution Code"] = res_code
+            geocode_fields["Resolution Type"] = RESOLUTION_LABELS.get(res_code, "Unrecognized code")
+            geocode_fields["County Helper"] = payload.get("admin2Name", "")
+            geocode_fields["Cresta Zone Helper"] = payload.get("zone1Code", "")
+            state_from_api = str(payload.get("admin1Code", "")).strip().upper()
+            geocode_fields["State Helper"] = state_from_api or str(loc_dict.get("STATE", "")).strip().upper()
+            ok_count += 1
+        elif status == 200:
+            geocode_fields["Resolution Type"] = "ERROR: HTTP 200 but no coordinates in response"
+        else:
+            geocode_fields["Resolution Type"] = f"ERROR: HTTP {status} - {error}"
+
+        preview_rows.append({
+            "STREETNAME": street, "CITY": loc_dict.get("CITY", ""),
+            "STATE (typed)": loc_dict.get("STATE", ""), "ZIPCODE": loc_dict.get("ZIPCODE", ""),
+            "Latitude": geocode_fields["Latitude"], "Longitude": geocode_fields["Longitude"],
+            "Resolution Type": geocode_fields["Resolution Type"],
+            "State (resolved)": geocode_fields["State Helper"],
+            "County (resolved)": geocode_fields["County Helper"],
+            "CRESTA": geocode_fields["Cresta Zone Helper"],
+        })
+
+        loc_rows.append(build_loc_row(account, loc_dict, len(loc_rows) + 1, geocode_fields))
+
+    acc_df = pd.DataFrame([build_acc_row(account)])
+    loc_df = pd.DataFrame(loc_rows)
+    return acc_df, loc_df, preview_rows, ok_count, total_count
 
 
 # --------------------------------------------------------------------------
@@ -424,9 +508,9 @@ st.markdown(
 
 st.title("📝 RMS LOC/ACC File Builder")
 st.caption(
-    "Enter account and location data, geocode addresses, then export RMS-import-ready ACC and LOC "
-    "CSV files. Ported directly from a confirmed-working RMS cleansing workbook's Data tab, LOC/ACC "
-    "formulas, and Geocode_DataTab macro."
+    "Enter account and location data, then geocode and build RMS-import-ready ACC and LOC CSV "
+    "files in one step. Ported directly from a confirmed-working RMS cleansing workbook's Data "
+    "tab, LOC/ACC formulas, and Geocode_DataTab macro."
 )
 
 if "locations_df" not in st.session_state:
@@ -438,9 +522,8 @@ with st.sidebar:
     api_key = st.text_input("Location Intelligence API key", type="password")
     verify_ssl = st.checkbox("Verify SSL", value=True)
     st.caption(
-        "Geocoding resolves each address to Latitude/Longitude, State/County/CRESTA - required "
-        "before the LOC file can be built, since STATECODE/COUNTY/CRESTA are all sourced from the "
-        "geocode response, not the raw typed address."
+        "Geocoding resolves each address to Latitude/Longitude, State/County/CRESTA - this "
+        "happens automatically as part of the combined Geocode & Build action below."
     )
 
 st.subheader("1. Account Information")
@@ -459,16 +542,16 @@ with col4:
 
 col5, col6, col7, col8, col9 = st.columns(5)
 with col5:
-    premium = st.number_input("Premium", value=0, step=1000)
+    premium = st.number_input("Premium", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
 with col6:
-    policy_limit = st.number_input("Policy Limit", value=0, step=100000)
+    policy_limit = st.number_input("Policy Limit", value=0, step=100000, min_value=0, max_value=LARGE_NUMBER_MAX)
 with col7:
-    attachment = st.number_input("Attachment", value=0, step=10000)
+    attachment = st.number_input("Attachment", value=0, step=10000, min_value=0, max_value=LARGE_NUMBER_MAX)
 with col8:
-    min_ded = st.number_input("Min Ded", value=0, step=1000)
+    min_ded = st.number_input("Min Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
 with col9:
-    max_ded = st.number_input("Max Ded", value=0, step=1000)
-share = st.number_input("Share", value=1.0, step=0.05, format="%.4f")
+    max_ded = st.number_input("Max Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
+share = st.number_input("Share", value=1.0, step=0.05, format="%.4f", min_value=0.0)
 
 account = {
     "Account Key": account_key, "Layer Name": layer_name,
@@ -483,16 +566,19 @@ st.divider()
 st.subheader("2. Location Information")
 st.caption(
     "Add one row per location. Dropdowns map directly to the RMS ATC/characteristic codes used by "
-    "the LOC file - pick the plain-English description and the code is handled automatically."
+    "the LOC file. Monetary fields (Building Value, Contents, etc.) accept any size value, "
+    "including figures in the hundreds of millions or more."
 )
 
-editable_cols = [c for c in LOCATION_INPUT_DEFAULTS if c not in
-                  ("Latitude", "Longitude", "Resolution Code", "Resolution Type",
-                   "State Helper", "County Helper", "Cresta Zone Helper")]
+number_column_config = {
+    field: st.column_config.NumberColumn(min_value=0, max_value=LARGE_NUMBER_MAX, step=1, format="%.2f")
+    for field in LARGE_NUMBER_FIELDS
+}
 
 locations_df = st.data_editor(
     st.session_state["locations_df"],
     column_config={
+        **number_column_config,
         "Construction": st.column_config.SelectboxColumn(options=options_list(CONSTRUCTION)),
         "Occupancy": st.column_config.SelectboxColumn(options=options_list(OCCUPANCY)),
         "Contents Damageability Grade": st.column_config.SelectboxColumn(options=options_list(CONTENTS_DAMAGE)),
@@ -508,13 +594,10 @@ locations_df = st.data_editor(
         "EQSL  Susceptibility": st.column_config.SelectboxColumn(options=options_list(SPRINKLER_LEAKAGE)),
         "EQSL Y/N": st.column_config.SelectboxColumn(options=["N", "Y"]),
         "STATE": st.column_config.TextColumn(help="2-letter code (CA) or full name (California) - either works."),
-        "Latitude": st.column_config.NumberColumn(disabled=True),
-        "Longitude": st.column_config.NumberColumn(disabled=True),
-        "Resolution Code": st.column_config.NumberColumn(disabled=True),
-        "Resolution Type": st.column_config.TextColumn(disabled=True),
-        "State Helper": st.column_config.TextColumn(disabled=True),
-        "County Helper": st.column_config.TextColumn(disabled=True),
-        "Cresta Zone Helper": st.column_config.TextColumn(disabled=True),
+        "Number of Buildings": st.column_config.NumberColumn(min_value=0, step=1),
+        "Number of Stories": st.column_config.NumberColumn(min_value=0, step=1),
+        "Year Built (YYYY)": st.column_config.NumberColumn(min_value=0, max_value=2100, step=1, format="%d"),
+        "Year Upgraded (YYYY)": st.column_config.NumberColumn(min_value=0, max_value=2100, step=1, format="%d"),
     },
     num_rows="dynamic",
     hide_index=True,
@@ -524,66 +607,50 @@ locations_df = st.data_editor(
 st.session_state["locations_df"] = locations_df
 
 st.divider()
-st.subheader("3. Geocode")
-geocode_btn = st.button("🌍 Geocode all locations", type="primary")
+st.subheader("3. Geocode & Build")
+st.caption(
+    "This single action geocodes every location above and builds the ACC/LOC files in one pass - "
+    "no separate steps required, so results are always in sync with what you see in the table."
+)
+build_btn = st.button("🌍 Geocode & 🏗️ Build ACC/LOC Files", type="primary")
 
-if geocode_btn:
+if build_btn:
     if not api_key:
         st.warning("Please provide a Location Intelligence API key (sidebar).")
+    elif not account_key.strip():
+        st.warning("Please enter an Account Key.")
     else:
         api = GeocodeApi(host.strip(), api_key, verify=verify_ssl)
-        df = st.session_state["locations_df"].copy()
-        progress = st.progress(0.0, text="Geocoding...")
-        ok_count = 0
-        for i, row in df.iterrows():
-            street = str(row.get("STREETNAME", "")).strip()
-            if not street:
-                progress.progress((i + 1) / max(len(df), 1))
-                continue
-            payload, status, error = api.geocode(
-                street, row.get("CITY", ""), row.get("COUNTY", ""),
-                row.get("STATE", ""), row.get("ZIPCODE", ""),
+        with st.spinner("Geocoding locations and building files..."):
+            acc_df, loc_df, preview_rows, ok_count, total_count = geocode_and_build(
+                api, account, locations_df,
             )
-            if status == 200 and isinstance(payload, dict):
-                df.at[i, "Latitude"] = payload.get("latitude")
-                df.at[i, "Longitude"] = payload.get("longitude")
-                res_code = payload.get("rmsGeoModelResolutionCode")
-                df.at[i, "Resolution Code"] = res_code
-                df.at[i, "Resolution Type"] = RESOLUTION_LABELS.get(res_code, "Unrecognized code")
-                df.at[i, "County Helper"] = payload.get("admin2Name", "")
-                df.at[i, "Cresta Zone Helper"] = payload.get("zone1Code", "")
-                state_from_api = str(payload.get("admin1Code", "")).strip().upper()
-                df.at[i, "State Helper"] = state_from_api or str(row.get("STATE", "")).strip().upper()
-                ok_count += 1
-            else:
-                df.at[i, "Resolution Type"] = f"ERROR: HTTP {status} - {error}"
-            progress.progress((i + 1) / max(len(df), 1), text=f"Geocoded {i + 1}/{len(df)}...")
-        progress.empty()
-        st.session_state["locations_df"] = df
-        st.success(f"Geocoded {ok_count}/{len(df)} location(s).")
+        st.session_state["acc_df"] = acc_df
+        st.session_state["loc_df"] = loc_df
+        st.session_state["preview_rows"] = preview_rows
+
+        if total_count == 0:
+            st.warning("No locations with a Street Name were found - add at least one location above.")
+        elif ok_count == total_count:
+            st.success(f"✅ All {ok_count}/{total_count} location(s) geocoded and files built successfully.")
+        else:
+            st.warning(
+                f"⚠️ {ok_count}/{total_count} location(s) geocoded successfully. "
+                f"{total_count - ok_count} location(s) failed - see the Geocode Results table below "
+                f"for details on each failure."
+            )
 
 st.divider()
 st.subheader("4. Preview & Export")
 
-build_btn = st.button("🏗️ Build ACC / LOC files", type="primary")
-if build_btn or "acc_df" in st.session_state:
-    if build_btn:
-        df = st.session_state["locations_df"]
-        acc_row = build_acc_row(account)
-        loc_rows = [build_loc_row(account, row.to_dict(), i + 1) for i, row in df.iterrows()
-                    if str(row.get("STREETNAME", "")).strip()]
-        st.session_state["acc_df"] = pd.DataFrame([acc_row])
-        st.session_state["loc_df"] = pd.DataFrame(loc_rows)
-
+if "acc_df" in st.session_state:
     acc_df = st.session_state["acc_df"]
     loc_df = st.session_state["loc_df"]
+    preview_rows = st.session_state.get("preview_rows", [])
 
-    not_geocoded = loc_df["LATITUDE"].isin(["", None]).sum() if not loc_df.empty else 0
-    if not_geocoded:
-        st.warning(
-            f"{not_geocoded} location(s) have not been geocoded yet - their STATECODE/COUNTY/CRESTA "
-            f"will be blank. Run step 3 before exporting."
-        )
+    if preview_rows:
+        with st.expander("🌍 Geocode Results (read-only)", expanded=True):
+            st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
 
     tab1, tab2 = st.tabs(["ACC preview", "LOC preview"])
     with tab1:
@@ -604,3 +671,5 @@ if build_btn or "acc_df" in st.session_state:
             "⬇️ Download LOC CSV", data=loc_df.to_csv(index=False).encode("utf-8"),
             file_name=f"{base_name}_LOC_{stamp}.csv", mime="text/csv", width="stretch",
         )
+else:
+    st.info("Run step 3 to generate the ACC/LOC files.")
