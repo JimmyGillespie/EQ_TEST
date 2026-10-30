@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-RMS LOC/ACC File Builder (Streamlit) - v2
+RMS LOC/ACC File Builder (Streamlit) - v3
 
 Ports the "Data" tab + its live formulas (LOC/ACC sheets) + Geocode_DataTab.bas
 macro from a confirmed-working RMS cleansing workbook into a single Streamlit
@@ -9,46 +9,50 @@ data-entry app. Produces RMS-import-ready ACC and LOC CSV files.
 Workflow:
   1. Enter Account Information (one record - mirrors Data!A2:N3).
   2. Enter one or more Locations (mirrors Data!B11:AV11 input columns).
-  3. Click "Geocode & Build ACC/LOC Files" - a SINGLE combined action that
-     geocodes every location and builds the ACC/LOC tables in one pass.
+  3. Click "Geocode & Build ACC/LOC Files" - geocodes every location and
+     builds the ACC/LOC tables in one combined pass.
 
-ARCHITECTURE NOTE - v2 fix for a real bug found in v1
+ARCHITECTURE NOTE - v3 fix for a real bug found in v2
 ------------------------------------------------------
-v1 tried to write geocode results (Latitude, Longitude, State/County/CRESTA)
-back INTO the same st.data_editor used for location input, across a
-separate button click and page rerun. This relies on Streamlit correctly
-re-adopting a changed `data` argument for an existing widget `key` -  which,
-in practice (especially with num_rows="dynamic" editors), does not reliably
-sync on every Streamlit version, and/or the "geocoded OK" counter was only
-checking the HTTP status rather than confirming usable coordinates were
-actually present in the response. Both of these could silently leave
-Latitude/Longitude blank even after a reported "Geocoded 1/1" success.
+v2 still had this pattern:
+    if "locations_df" not in st.session_state:
+        st.session_state["locations_df"] = pd.DataFrame(...)
+    locations_df = st.data_editor(st.session_state["locations_df"], key="location_editor", ...)
+    st.session_state["locations_df"] = locations_df     # <-- THE BUG
 
-v2 removes the round-trip entirely:
-  - The location editor ONLY ever holds the fields the user types. It never
-    displays or stores geocode outputs.
-  - Geocoding and file-building happen in ONE button handler, in ONE script
-    run, operating on the data_editor's just-returned value as a plain
-    local Python variable (not session_state) - so there is no cross-run
-    synchronization to get wrong.
-  - A row only counts as successfully geocoded if the response contains a
-    non-null, non-zero latitude AND longitude - not merely HTTP 200.
-  - Geocode results are shown in a separate, read-only preview table built
-    fresh every time the combined action runs.
+Once a widget has a stable `key`, Streamlit internally owns and persists
+ITS OWN edited state keyed by `key` - that is the single source of truth
+across reruns. Manually copying the widget's return value back into the
+SAME session_state slot that is also used to seed `data=` on every rerun
+creates a feedback loop that, especially after adding/deleting rows
+(num_rows="dynamic") or on certain Streamlit versions, can cause the
+editor to silently reset or drop in-progress edits (e.g. STATE, CITY,
+ZIPCODE appearing blank again after a rerun triggered by clicking a
+button elsewhere on the page).
 
-Known issues in the SOURCE WORKBOOK this app intentionally does NOT
-reproduce (fixed here instead):
-  - LOC!T2 (YEARBUILT) and LOC!AS2 (YEARUPGRAD) build a string
-    "01/01/"&year. RMS needs these as PLAIN 4-DIGIT YEAR INTEGERS, not
-    dates - this app outputs the bare year.
-  - ACC!Y2 (BLANDEDCUR) contains a broken #REF! formula from a deleted
-    column - this app outputs an empty value for that field instead.
-  - LOC Latitude/Longitude/ADDRMATCH/Resolution Type columns have no
-    formula at all in the live sheet - this app populates them from the
-    geocode step, which is clearly the columns' intended purpose.
+v3 fix:
+  - st.session_state["locations_df"] is used ONLY ONCE, to seed the
+    editor the very first time it is ever rendered. It is NEVER written
+    to again.
+  - The editor's return value each run (`edited_locations_df`) is used
+    DIRECTLY and ONLY as a local variable for that run's Build logic -
+    there is no second copy of the data living in session_state that
+    could ever go stale or conflict with the widget's own internal state.
+  - STREETNAME / CITY / COUNTY / STATE / ZIPCODE are explicitly configured
+    as TextColumn, which prevents pandas from silently inferring a numeric
+    dtype for a column like ZIPCODE and dropping leading zeros (e.g.
+    Boston "02134" -> 2134), which would look exactly like "the field
+    didn't save."
+  - A "🔍 Current form values" debug expander shows exactly what the app
+    sees for the Account Key and the location table on every single rerun,
+    so it is immediately obvious whether a field truly isn't being
+    captured vs. simply not yet committed in the browser (e.g. user has
+    not clicked/tabbed out of the cell yet).
+  - A "Reset location table" button is provided as a safety valve in case
+    session state ever gets into a bad shape (e.g. after upgrading the
+    app with new default columns).
 """
 
-import io
 import time
 from datetime import date, datetime
 
@@ -59,7 +63,7 @@ from requests.adapters import HTTPAdapter
 
 TIMEOUT = 60
 MAX_RETRIES = 4
-LARGE_NUMBER_MAX = 999_999_999_999  # effectively unbounded for insurance values (up to ~$1 trillion)
+LARGE_NUMBER_MAX = 999_999_999_999  # effectively unbounded for insurance values
 
 # --------------------------------------------------------------------------
 # Reference data - extracted directly from the workbook's "Schemas" sheet.
@@ -230,12 +234,11 @@ class GeocodeApi:
 
 # --------------------------------------------------------------------------
 # Default per-location field set (mirrors Data!B11:AV11 input columns).
-# NOTE: geocode OUTPUT fields (Latitude, Longitude, Resolution Code/Type,
-# State/County/CRESTA helpers) are intentionally NOT included here anymore -
-# they are computed fresh every time the combined Geocode & Build action
-# runs, and shown in a separate read-only preview table. This is the core
-# v2 fix: the editable table never needs to "receive back" computed data.
+# Geocode OUTPUT fields are NOT stored here - they're computed fresh every
+# time the combined Geocode & Build action runs.
 # --------------------------------------------------------------------------
+
+TEXT_FIELDS = ["STREETNAME", "CITY", "COUNTY", "STATE", "ZIPCODE"]
 
 LOCATION_INPUT_DEFAULTS = {
     "STREETNAME": "", "CITY": "", "COUNTY": "", "STATE": "", "ZIPCODE": "",
@@ -257,10 +260,6 @@ LOCATION_INPUT_DEFAULTS = {
     "Min $/sf Flag": "", "Evaluated Building Value": 0,
 }
 
-# Monetary / large-number fields that must accept big values without
-# truncation or silent clamping - addressed explicitly via NumberColumn
-# configs below (min_value=0, no max_value cap except a generous ceiling,
-# and a format that does not round or display in scientific notation).
 LARGE_NUMBER_FIELDS = [
     "Building Value", "Contents", "BI", "Site Limit", "Site Deductible",
     "Combined Limit", "Combined Deductible", "Buildings Deductible",
@@ -338,10 +337,8 @@ def build_acc_row(account):
 
 def build_loc_row(account, loc, loc_number, geocode_fields):
     """Builds one LOC row dict. `loc` is the user's typed input fields for
-    this location; `geocode_fields` is a dict with Latitude, Longitude,
-    Resolution Code, Resolution Type, State Helper, County Helper, Cresta
-    Zone Helper - computed fresh in the SAME pass, never round-tripped
-    through the editor."""
+    this location; `geocode_fields` is computed fresh in the SAME pass,
+    never round-tripped through the editor."""
     row = {h: "" for h in LOC_HEADERS}
     account_key = str(account.get("Account Key", "")).strip()
     if not account_key:
@@ -424,8 +421,8 @@ def build_loc_row(account, loc, loc_number, geocode_fields):
 
 def geocode_and_build(api, account, locations_df):
     """Single-pass pipeline: geocodes every location with a STREETNAME and
-    builds the matching LOC row immediately, using only local variables.
-    Returns (acc_df, loc_df, preview_rows, ok_count, total_count)."""
+    builds the matching LOC row immediately, using only local variables -
+    no session_state involved at all."""
     preview_rows = []
     loc_rows = []
     ok_count = 0
@@ -454,9 +451,7 @@ def geocode_and_build(api, account, locations_df):
             lon = payload.get("longitude")
 
         # A row only counts as successfully geocoded if BOTH coordinates
-        # are present and non-null - matching HTTP 200 alone is NOT enough
-        # (this was the root cause of v1's "Geocoded 1/1 but still blank"
-        # bug: it counted success on status code only).
+        # are present and non-null - matching HTTP 200 alone is NOT enough.
         if status == 200 and lat is not None and lon is not None:
             res_code = payload.get("rmsGeoModelResolutionCode")
             geocode_fields["Latitude"] = lat
@@ -513,8 +508,13 @@ st.caption(
     "tab, LOC/ACC formulas, and Geocode_DataTab macro."
 )
 
-if "locations_df" not in st.session_state:
-    st.session_state["locations_df"] = pd.DataFrame([LOCATION_INPUT_DEFAULTS.copy()])
+# --------------------------------------------------------------------------
+# Location table state: seeded ONCE, never overwritten afterward. The
+# editor's own `key` is the single source of truth for its edited state on
+# every subsequent rerun - see the module docstring for why this matters.
+# --------------------------------------------------------------------------
+if "locations_df_seed" not in st.session_state:
+    st.session_state["locations_df_seed"] = pd.DataFrame([LOCATION_INPUT_DEFAULTS.copy()])
 
 with st.sidebar:
     st.header("Geocode connection")
@@ -525,33 +525,37 @@ with st.sidebar:
         "Geocoding resolves each address to Latitude/Longitude, State/County/CRESTA - this "
         "happens automatically as part of the combined Geocode & Build action below."
     )
+    st.divider()
+    if st.button("🔄 Reset location table", help="Clears all location rows back to a single blank row."):
+        st.session_state["locations_df_seed"] = pd.DataFrame([LOCATION_INPUT_DEFAULTS.copy()])
+        st.rerun()
 
 st.subheader("1. Account Information")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    account_key = st.text_input("Account Key", placeholder="25M_1234")
-    layer_name = st.text_input("Layer Name", placeholder="25M")
+    account_key = st.text_input("Account Key", placeholder="25M_1234", key="account_key_input")
+    layer_name = st.text_input("Layer Name", placeholder="25M", key="layer_name_input")
 with col2:
-    inception_date = st.date_input("Inception Date", value=date.today())
-    expiry_date = st.date_input("Expiry Date", value=date.today())
+    inception_date = st.date_input("Inception Date", value=date.today(), key="inception_date_input")
+    expiry_date = st.date_input("Expiry Date", value=date.today(), key="expiry_date_input")
 with col3:
-    underwriter = st.text_input("Underwriter Initials", placeholder="TR")
-    lob = st.text_input("Line of Business", placeholder="ANV_PacificPoint")
+    underwriter = st.text_input("Underwriter Initials", placeholder="TR", key="underwriter_input")
+    lob = st.text_input("Line of Business", placeholder="ANV_PacificPoint", key="lob_input")
 with col4:
-    eqsl_account = st.selectbox("EQSL Y/N", ["N", "Y"])
+    eqsl_account = st.selectbox("EQSL Y/N", ["N", "Y"], key="eqsl_account_input")
 
 col5, col6, col7, col8, col9 = st.columns(5)
 with col5:
-    premium = st.number_input("Premium", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
+    premium = st.number_input("Premium", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX, key="premium_input")
 with col6:
-    policy_limit = st.number_input("Policy Limit", value=0, step=100000, min_value=0, max_value=LARGE_NUMBER_MAX)
+    policy_limit = st.number_input("Policy Limit", value=0, step=100000, min_value=0, max_value=LARGE_NUMBER_MAX, key="policy_limit_input")
 with col7:
-    attachment = st.number_input("Attachment", value=0, step=10000, min_value=0, max_value=LARGE_NUMBER_MAX)
+    attachment = st.number_input("Attachment", value=0, step=10000, min_value=0, max_value=LARGE_NUMBER_MAX, key="attachment_input")
 with col8:
-    min_ded = st.number_input("Min Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
+    min_ded = st.number_input("Min Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX, key="min_ded_input")
 with col9:
-    max_ded = st.number_input("Max Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
-share = st.number_input("Share", value=1.0, step=0.05, format="%.4f", min_value=0.0)
+    max_ded = st.number_input("Max Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX, key="max_ded_input")
+share = st.number_input("Share", value=1.0, step=0.05, format="%.4f", min_value=0.0, key="share_input")
 
 account = {
     "Account Key": account_key, "Layer Name": layer_name,
@@ -567,17 +571,26 @@ st.subheader("2. Location Information")
 st.caption(
     "Add one row per location. Dropdowns map directly to the RMS ATC/characteristic codes used by "
     "the LOC file. Monetary fields (Building Value, Contents, etc.) accept any size value, "
-    "including figures in the hundreds of millions or more."
+    "including figures in the hundreds of millions or more. STREETNAME/CITY/COUNTY/STATE/ZIPCODE "
+    "are kept as plain text so values like a leading-zero ZIP code are never silently altered."
 )
 
 number_column_config = {
     field: st.column_config.NumberColumn(min_value=0, max_value=LARGE_NUMBER_MAX, step=1, format="%.2f")
     for field in LARGE_NUMBER_FIELDS
 }
+text_column_config = {field: st.column_config.TextColumn() for field in TEXT_FIELDS}
 
-locations_df = st.data_editor(
-    st.session_state["locations_df"],
+# IMPORTANT: `data=` is only used to seed this widget the FIRST time it is
+# ever rendered for this session. On every later rerun, Streamlit uses its
+# own internally tracked edited state for this `key` - the return value
+# below (`edited_locations_df`) always reflects the CURRENT, up-to-date
+# edited data for this run. We deliberately do NOT write this back into
+# st.session_state["locations_df_seed"] (see module docstring).
+edited_locations_df = st.data_editor(
+    st.session_state["locations_df_seed"],
     column_config={
+        **text_column_config,
         **number_column_config,
         "Construction": st.column_config.SelectboxColumn(options=options_list(CONSTRUCTION)),
         "Occupancy": st.column_config.SelectboxColumn(options=options_list(OCCUPANCY)),
@@ -593,7 +606,6 @@ locations_df = st.data_editor(
         "Sprinkler Type": st.column_config.SelectboxColumn(options=options_list(SPRINKLER_TYPE)),
         "EQSL  Susceptibility": st.column_config.SelectboxColumn(options=options_list(SPRINKLER_LEAKAGE)),
         "EQSL Y/N": st.column_config.SelectboxColumn(options=["N", "Y"]),
-        "STATE": st.column_config.TextColumn(help="2-letter code (CA) or full name (California) - either works."),
         "Number of Buildings": st.column_config.NumberColumn(min_value=0, step=1),
         "Number of Stories": st.column_config.NumberColumn(min_value=0, step=1),
         "Year Built (YYYY)": st.column_config.NumberColumn(min_value=0, max_value=2100, step=1, format="%d"),
@@ -604,13 +616,19 @@ locations_df = st.data_editor(
     width="stretch",
     key="location_editor",
 )
-st.session_state["locations_df"] = locations_df
+
+with st.expander("🔍 Current form values (debug view - confirms what the app currently sees)"):
+    st.write("**Account Key:**", repr(account_key))
+    st.write("**Location table right now:**")
+    st.dataframe(
+        edited_locations_df[[c for c in TEXT_FIELDS if c in edited_locations_df.columns]],
+        width="stretch", hide_index=True,
+    )
 
 st.divider()
 st.subheader("3. Geocode & Build")
 st.caption(
-    "This single action geocodes every location above and builds the ACC/LOC files in one pass - "
-    "no separate steps required, so results are always in sync with what you see in the table."
+    "This single action geocodes every location above and builds the ACC/LOC files in one pass."
 )
 build_btn = st.button("🌍 Geocode & 🏗️ Build ACC/LOC Files", type="primary")
 
@@ -618,12 +636,15 @@ if build_btn:
     if not api_key:
         st.warning("Please provide a Location Intelligence API key (sidebar).")
     elif not account_key.strip():
-        st.warning("Please enter an Account Key.")
+        st.warning(
+            f"Please enter an Account Key. Current value seen by the app: {repr(account_key)}. "
+            f"If you did type one, check the debug expander above to confirm it registered before clicking Build."
+        )
     else:
         api = GeocodeApi(host.strip(), api_key, verify=verify_ssl)
         with st.spinner("Geocoding locations and building files..."):
             acc_df, loc_df, preview_rows, ok_count, total_count = geocode_and_build(
-                api, account, locations_df,
+                api, account, edited_locations_df,
             )
         st.session_state["acc_df"] = acc_df
         st.session_state["loc_df"] = loc_df
