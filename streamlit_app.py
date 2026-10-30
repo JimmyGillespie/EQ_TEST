@@ -294,6 +294,346 @@ def build_s3_put_headers(upload_url: str, region: str, access_key: str,
 # RMS Platform API client
 # ==========================================================================
 
+
+# ==========================================================================
+# Verify Import + Geocode/Hazard/Analysis pipeline
+# Ported from modRMSImport.bas (confirmed-working VBA).
+# ==========================================================================
+
+TIMEOUT_CONNECT = 30
+TIMEOUT_READ = 120
+VERIFY_MAX_RETRIES = 3
+PAGE_LIMIT = 1000
+
+
+class ImportVerifier:
+    """Thin wrapper around the confirmed GET /exposures/{id}/locations
+    (and /portfolios/{id}/locations) endpoints, used purely for counting."""
+
+    def __init__(self, host: str, api_key: str, verify: bool = True):
+        self.host = host.strip()
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        clean_key = (api_key or "").strip()
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip()
+        self.session.headers.update({"Accept": "application/json", "Authorization": clean_key})
+        self.session.verify = verify
+
+    def _get(self, url, retries=VERIFY_MAX_RETRIES):
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                r = self.session.get(url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                return r.status_code, r.text
+            except requests.RequestException as exc:
+                last_exc = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return 0, f"GET error: {last_exc}"
+        return 0, f"GET error: {last_exc}"
+
+    @staticmethod
+    def _safe_json(text):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return None
+
+    def count_locations(self, exposure_id: str, portfolio_id: str = "") -> tuple[int, str]:
+        """Returns (count, error_message). error_message is '' on success.
+        Paginates through every location for the exposure (optionally
+        scoped to a portfolio, if the tenant's API surface supports that
+        path) and returns the total count actually present in RMS."""
+        if portfolio_id:
+            base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/portfolios/{portfolio_id}/locations"
+        else:
+            base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/locations"
+
+        total = 0
+        offset = 0
+        while True:
+            status, text = self._get(f"{base}?limit={PAGE_LIMIT}&offset={offset}")
+            if status != 200:
+                if offset == 0:
+                    return 0, f"HTTP {status}: {text[:300]}"
+                break  # partial results already counted - stop paginating
+            parsed = self._safe_json(text)
+            items = parsed if isinstance(parsed, list) else (
+                parsed.get("locations") or parsed.get("items") or parsed.get("data") or []
+                if isinstance(parsed, dict) else []
+            )
+            if not items:
+                break
+            total += len(items)
+            if len(items) < PAGE_LIMIT:
+                break
+            offset += PAGE_LIMIT
+            if offset > 500000:
+                break
+        return total, ""
+
+
+def verify_location_count(verifier: ImportVerifier, exposure_id: str, portfolio_id: str,
+                           expected_count: int) -> dict:
+    """Returns a result dict with keys: expected, actual, match, error,
+    message - ready to render directly in a Streamlit UI."""
+    actual_count, error = verifier.count_locations(exposure_id, portfolio_id)
+    if error:
+        return {
+            "expected": expected_count, "actual": None, "match": False, "error": error,
+            "message": f"Could not verify location count: {error}",
+        }
+    match = actual_count == expected_count
+    if match:
+        message = f"✅ All {expected_count} location(s) confirmed present in RMS."
+    elif actual_count < expected_count:
+        missing = expected_count - actual_count
+        message = (f"⚠️ Only {actual_count} of {expected_count} location(s) found in RMS "
+                    f"({missing} missing) - check the import job's error/warning log for "
+                    f"rejected or duplicate rows.")
+    else:
+        extra = actual_count - expected_count
+        message = (f"⚠️ RMS reports {actual_count} location(s), {extra} MORE than the "
+                    f"{expected_count} submitted - this portfolio may already have contained "
+                    f"locations from a prior import.")
+    return {
+        "expected": expected_count, "actual": actual_count, "match": match,
+        "error": "", "message": message,
+    }
+
+
+TIMEOUT_CONNECT = 30
+TIMEOUT_READ = 120
+ANALYSIS_MAX_RETRIES = 3
+
+TERMINAL_STATUSES = {"FINISHED", "SUCCEEDED", "COMPLETED", "FAILED", "CANCELLED", "ERROR"}
+SUCCESS_STATUSES = {"FINISHED", "SUCCEEDED", "COMPLETED"}
+
+# Live confirmed defaults, pulled directly from the source workbook's
+# Controls!K1:M9 settings block (NOT guessed) - shown as starting values
+# in the UI, editable per the macro's own "confirm which ID you actually
+# want" guidance.
+CONFIRMED_DEFAULTS = {
+    "model_profile_id": 1256,
+    "event_rate_scheme_id": 163,
+    "vintage": "RL24",
+    "output_profile_id": 11,
+    "currency": "USD",
+    "geohaz_engine_version": "25.0",  # Format$(25, "0.0") - RMS rejects a bare "25"
+    "geohaz_engine_type": "RL",
+    "hazard_layer_name": "earthquake",
+}
+
+
+class RmsAnalysisApi:
+    """Wraps the geocode/hazard/analysis job submission + polling endpoints.
+    Shares the same host/key/resource-group pattern as RmsImportApi."""
+
+    def __init__(self, host: str, api_key: str, verify: bool = True):
+        self.host = host.strip()
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        clean_key = (api_key or "").strip()
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip()
+        self.api_key = clean_key
+        self.session.headers.update({"Accept": "application/json", "Authorization": clean_key})
+        self.session.verify = verify
+        self._resource_group_id = None
+        self._resource_group_id_fetched = False
+
+    def _get(self, url, retries=ANALYSIS_MAX_RETRIES):
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                r = self.session.get(url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                return r.status_code, r.text
+            except requests.RequestException as exc:
+                last_exc = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return 0, f"GET error: {last_exc}"
+        return 0, f"GET error: {last_exc}"
+
+    def _post(self, url, body_json: str, extra_headers: dict | None = None, retries=ANALYSIS_MAX_RETRIES):
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "Authorization": self.api_key}
+        if extra_headers:
+            headers.update(extra_headers)
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                r = self.session.post(url, data=body_json.encode("utf-8"), headers=headers,
+                                       timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                return r.status_code, r.text, dict(r.headers)
+            except requests.RequestException as exc:
+                last_exc = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return 0, f"POST error: {last_exc}", {}
+        return 0, f"POST error: {last_exc}", {}
+
+    @staticmethod
+    def _safe_json(text):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return None
+
+    def get_resource_group_id(self) -> str:
+        if self._resource_group_id_fetched:
+            return self._resource_group_id or ""
+        self._resource_group_id_fetched = True
+        self._resource_group_id = ""
+        url = f"https://{self.host}/platform/tenantdata/v1/entitlements/RI-RISKMODELER/resourcegroups"
+        status, text = self._get(url)
+        if status == 200:
+            parsed = self._safe_json(text)
+            items = []
+            if isinstance(parsed, list):
+                items = parsed
+            elif isinstance(parsed, dict):
+                for k in ("resourceGroups", "items", "data"):
+                    if isinstance(parsed.get(k), list):
+                        items = parsed[k]
+                        break
+            if items and isinstance(items[0], dict):
+                first = items[0]
+                rgid = first.get("resourceGroupId") or first.get("id") or first.get("resourcegroupId") or ""
+                self._resource_group_id = str(rgid)
+        return self._resource_group_id or ""
+
+    @staticmethod
+    def _extract_job_id(status, text, headers):
+        """Common id-extraction logic used by all three job submissions:
+        try id/jobId/workflowId in the body first, then fall back to the
+        Location header's last path segment (confirmed pattern from the
+        VBA, used when RMS returns an empty 201 body)."""
+        if not (200 <= status < 300):
+            return ""
+        job_id = ""
+        parsed = RmsAnalysisApi._safe_json(text)
+        if isinstance(parsed, dict):
+            job_id = str(parsed.get("id") or parsed.get("jobId") or parsed.get("workflowId") or "")
+        if not job_id:
+            location = headers.get("Location") or headers.get("location") or ""
+            if location:
+                job_id = location.rstrip("/").split("/")[-1]
+        return job_id
+
+    # ---- Stage 1: Geocode job ----
+
+    def submit_geocode_job(self, edm_name: str, portfolio_id: str, engine_type: str,
+                            engine_version: str, skip_prev_geocoded: bool) -> tuple[str, str]:
+        """Returns (job_id, raw_response_text)."""
+        url = f"https://{self.host}/riskmodeler/v1/portfolios/{portfolio_id}/geohaz?datasource={edm_name}"
+        body = json.dumps([{
+            "name": "geocode", "type": "geocode",
+            "engineType": engine_type, "version": engine_version,
+            "layerOptions": {
+                "skipPrevGeocoded": skip_prev_geocoded,
+                "aggregateTriggerEnabled": False, "geoLicenseType": "0",
+            },
+        }])
+        resource_group_id = self.get_resource_group_id()
+        extra_headers = {"x-rms-resource-group-id": resource_group_id} if resource_group_id else None
+        status, text, headers = self._post(url, body, extra_headers=extra_headers)
+        return self._extract_job_id(status, text, headers), text
+
+    # ---- Stage 2: Hazard job ----
+
+    def submit_hazard_job(self, edm_name: str, portfolio_id: str, hazard_layer_name: str,
+                           engine_type: str, engine_version: str) -> tuple[str, str]:
+        url = f"https://{self.host}/riskmodeler/v1/portfolios/{portfolio_id}/geohaz?datasource={edm_name}"
+        body = json.dumps([{
+            "name": hazard_layer_name, "type": "hazard",
+            "engineType": engine_type, "version": engine_version,
+            "layerOptions": {"skipPrevHazard": False, "overrideUserDef": False},
+        }])
+        resource_group_id = self.get_resource_group_id()
+        extra_headers = {"x-rms-resource-group-id": resource_group_id} if resource_group_id else None
+        status, text, headers = self._post(url, body, extra_headers=extra_headers)
+        return self._extract_job_id(status, text, headers), text
+
+    # ---- Stage 3: Analysis job ----
+
+    def submit_analysis_job(self, edm_name: str, portfolio_id: str, model_profile_id: int,
+                             event_rate_scheme_id: int, output_profile_id: int,
+                             vintage: str, currency: str = "USD",
+                             as_of_date: str = "2024-04-03") -> tuple[str, str]:
+        url = f"https://{self.host}/riskmodeler/v2/portfolios/{portfolio_id}/process"
+        body = json.dumps({
+            "currency": {"code": currency, "scheme": "RMS", "asOfDate": as_of_date, "vintage": vintage},
+            "globalAnalysisSettings": {
+                "franchiseDeductible": False, "treatConstructionOccupancyAsUnknown": True,
+            },
+            "edm": edm_name, "exposureType": "PORTFOLIO",
+            "modelProfileId": model_profile_id, "eventRateSchemeId": event_rate_scheme_id,
+            "id": portfolio_id, "outputProfileId": output_profile_id,
+        })
+        resource_group_id = self.get_resource_group_id()
+        extra_headers = {"x-rms-resource-group-id": resource_group_id} if resource_group_id else None
+        status, text, headers = self._post(url, body, extra_headers=extra_headers)
+        return self._extract_job_id(status, text, headers), text
+
+    # ---- Status polling (shared logic, different candidate URL sets) ----
+
+    def _check_status_once(self, job_id: str, candidates: list, cached_status_url: str = ""):
+        """Returns (status_string, status_url_used, raw_text). Status is
+        'UNKNOWN' if no candidate URL responds 200."""
+        status_url = cached_status_url
+        if not status_url:
+            for candidate in candidates:
+                status, text = self._get(candidate)
+                if status == 200:
+                    status_url = candidate
+                    break
+            if not status_url:
+                return "UNKNOWN", "", ""
+        status, text = self._get(status_url)
+        parsed = self._safe_json(text)
+        st = ""
+        if isinstance(parsed, dict):
+            st = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
+        return (st or "UNKNOWN"), status_url, text
+
+    def check_geocode_status(self, job_id: str, cached_status_url: str = ""):
+        candidates = [
+            f"https://{self.host}/platform/geohaz/v1/jobs/{job_id}",
+            f"https://{self.host}/riskmodeler/v1/workflows/{job_id}",
+            f"https://{self.host}/platform/v1/workflows/{job_id}",
+        ]
+        return self._check_status_once(job_id, candidates, cached_status_url)
+
+    def check_hazard_status(self, job_id: str, cached_status_url: str = ""):
+        # Same candidate set as geocode - both are geohaz-layer jobs.
+        return self.check_geocode_status(job_id, cached_status_url)
+
+    def check_analysis_status(self, job_id: str, cached_status_url: str = ""):
+        candidates = [
+            f"https://{self.host}/riskmodeler/v1/workflows/{job_id}",
+            f"https://{self.host}/platform/v1/workflows/{job_id}",
+            f"https://{self.host}/riskmodeler/v2/workflows/{job_id}",
+        ]
+        return self._check_status_once(job_id, candidates, cached_status_url)
+
+
+def is_terminal(status: str) -> bool:
+    return status in TERMINAL_STATUSES
+
+
+def is_success(status: str) -> bool:
+    return status in SUCCESS_STATUSES
+
+
 class RmsImportApi:
     """Wraps every confirmed endpoint used by GetOrCreateEDM -> ... ->
     SubmitImportJob -> CheckJobStatusOnce. One instance per import run."""
@@ -1412,3 +1752,198 @@ else:
                     st.code(raw[:2000])
             else:
                 st.info(f"⏳ Status: {status}")
+
+st.divider()
+st.subheader("5. Verify Import & Run Analysis")
+st.caption(
+    "Confirms every location landed in RMS, then runs the Geocode → Hazard → Analysis chain for "
+    "this portfolio. Ported from the confirmed-working modRMSImport.bas pipeline. Each stage must "
+    "succeed before the next becomes available - this is stricter than the source macro by design, "
+    "since submitting an analysis against an incomplete portfolio wastes real compute for a wrong answer."
+)
+
+if "rms_import_job" not in st.session_state:
+    st.info("Complete step 4 (Create EDM & Import) before verifying or running analysis.")
+else:
+    job_info = st.session_state["rms_import_job"]
+    exposure_id = job_info["exposure_id"]
+    portfolio_id = job_info["portfolio_id"]
+    edm_name_for_analysis = job_info["edm_name"]
+
+    if not portfolio_id:
+        st.warning(
+            "No portfolio was created during import (the job targeted the EDM directly) - "
+            "the geocode/hazard/analysis chain below requires a portfolio ID, so this step "
+            "cannot proceed. Re-run step 4 ensuring a portfolio is created."
+        )
+    else:
+        st.markdown(f"**Portfolio:** `{portfolio_id}`  ·  **EDM:** `{edm_name_for_analysis}`  ·  "
+                    f"**Exposure:** `{exposure_id}`")
+
+        # ---- Stage A: Verify location count ----
+        st.markdown("#### A. Verify location count")
+        expected_count = len(st.session_state.get("loc_df", pd.DataFrame()))
+        st.caption(f"Expected: {expected_count} location(s), based on the LOC file built in step 3.")
+
+        if st.button("🔎 Verify locations imported"):
+            verifier = ImportVerifier(job_info["host"], job_info["api_key"], verify=job_info["verify_ssl"])
+            with st.spinner("Counting locations in RMS..."):
+                result = verify_location_count(verifier, exposure_id, portfolio_id, expected_count)
+            st.session_state["verify_result"] = result
+
+        if "verify_result" in st.session_state:
+            vr = st.session_state["verify_result"]
+            if vr["error"]:
+                st.error(vr["message"])
+            elif vr["match"]:
+                st.success(vr["message"])
+            else:
+                st.warning(vr["message"])
+
+        verification_passed = st.session_state.get("verify_result", {}).get("match", False)
+
+        st.divider()
+
+        # ---- Stage B/C/D: Geocode -> Hazard -> Analysis ----
+        st.markdown("#### B. Geocode → Hazard → Analysis settings")
+        if not verification_passed:
+            st.info("🔒 Run and pass location verification above to unlock the analysis settings below.")
+        else:
+            with st.form(key="analysis_form", clear_on_submit=False):
+                st.caption(
+                    "Defaults below are read from this workbook's confirmed Controls!K1:M9 settings "
+                    "block. Confirm these are the correct IDs for this analysis before submitting - "
+                    "a wrong Model Profile or Event Rate Scheme ID will silently produce a wrong result."
+                )
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    model_profile_id = st.number_input(
+                        "Model Profile ID", value=CONFIRMED_DEFAULTS["model_profile_id"], step=1)
+                    event_rate_scheme_id = st.number_input(
+                        "Event Rate Scheme ID", value=CONFIRMED_DEFAULTS["event_rate_scheme_id"], step=1)
+                with ac2:
+                    output_profile_id = st.number_input(
+                        "Output Profile ID", value=CONFIRMED_DEFAULTS["output_profile_id"], step=1)
+                    vintage = st.text_input("Vintage", value=CONFIRMED_DEFAULTS["vintage"])
+                with ac3:
+                    geohaz_engine_type = st.text_input(
+                        "Geohaz Engine Type", value=CONFIRMED_DEFAULTS["geohaz_engine_type"])
+                    geohaz_engine_version = st.text_input(
+                        "Geohaz Engine Version", value=CONFIRMED_DEFAULTS["geohaz_engine_version"],
+                        help="RMS requires one decimal place, e.g. '25.0' - never a bare '25'.")
+                hazard_layer_name = st.text_input(
+                    "Hazard Layer Name", value=CONFIRMED_DEFAULTS["hazard_layer_name"])
+                skip_prev_geocoded = st.checkbox(
+                    "Skip re-geocoding (locations already have Lat/Long)", value=True,
+                    help="Matches AccountHasLatLong in the source macro - set False if any location "
+                         "is missing coordinates and needs RMS to geocode it during this step.")
+
+                run_pipeline_submitted = st.form_submit_button(
+                    "🚀 Submit Geocode → Hazard → Analysis", type="primary")
+
+            if run_pipeline_submitted:
+                analysis_api = RmsAnalysisApi(job_info["host"], job_info["api_key"], verify=job_info["verify_ssl"])
+                pipeline_status = st.status("Running Geocode → Hazard → Analysis chain...", expanded=True)
+
+                def plog(msg):
+                    pipeline_status.write(msg)
+
+                try:
+                    # --- Geocode ---
+                    pipeline_status.update(label="Stage 1/3: Submitting geocode job...")
+                    geo_job_id, geo_raw = analysis_api.submit_geocode_job(
+                        edm_name_for_analysis, portfolio_id, geohaz_engine_type,
+                        geohaz_engine_version, skip_prev_geocoded,
+                    )
+                    if not geo_job_id:
+                        plog(f"❌ Geocode job submission failed.\nRaw: {geo_raw[:500]}")
+                        pipeline_status.update(label="❌ Geocode submission failed", state="error")
+                    else:
+                        plog(f"✅ Geocode job submitted - jobId={geo_job_id}")
+                        geo_status, geo_status_url = "UNKNOWN", ""
+                        for i in range(1, 25):
+                            time.sleep(5)
+                            geo_status, geo_status_url, _ = analysis_api.check_geocode_status(
+                                geo_job_id, cached_status_url=geo_status_url)
+                            plog(f"  Geocode poll {i}/24: {geo_status}")
+                            if is_terminal(geo_status):
+                                break
+
+                        if not is_success(geo_status):
+                            plog(f"❌ Geocode phase ended with status: {geo_status}")
+                            pipeline_status.update(label=f"❌ Geocode phase failed ({geo_status})", state="error")
+                        else:
+                            plog(f"✅ Geocode phase succeeded ({geo_status})")
+
+                            # --- Hazard ---
+                            pipeline_status.update(label="Stage 2/3: Submitting hazard job...")
+                            haz_job_id, haz_raw = analysis_api.submit_hazard_job(
+                                edm_name_for_analysis, portfolio_id, hazard_layer_name,
+                                geohaz_engine_type, geohaz_engine_version,
+                            )
+                            if not haz_job_id:
+                                plog(f"❌ Hazard job submission failed.\nRaw: {haz_raw[:500]}")
+                                pipeline_status.update(label="❌ Hazard submission failed", state="error")
+                            else:
+                                plog(f"✅ Hazard job submitted - jobId={haz_job_id}")
+                                haz_status, haz_status_url = "UNKNOWN", ""
+                                for i in range(1, 25):
+                                    time.sleep(5)
+                                    haz_status, haz_status_url, _ = analysis_api.check_hazard_status(
+                                        haz_job_id, cached_status_url=haz_status_url)
+                                    plog(f"  Hazard poll {i}/24: {haz_status}")
+                                    if is_terminal(haz_status):
+                                        break
+
+                                if not is_success(haz_status):
+                                    plog(f"❌ Hazard phase ended with status: {haz_status}")
+                                    pipeline_status.update(label=f"❌ Hazard phase failed ({haz_status})", state="error")
+                                else:
+                                    plog(f"✅ Hazard phase succeeded ({haz_status})")
+
+                                    # --- Analysis ---
+                                    pipeline_status.update(label="Stage 3/3: Submitting analysis job...")
+                                    an_job_id, an_raw = analysis_api.submit_analysis_job(
+                                        edm_name_for_analysis, portfolio_id,
+                                        int(model_profile_id), int(event_rate_scheme_id),
+                                        int(output_profile_id), vintage.strip(),
+                                    )
+                                    if not an_job_id:
+                                        plog(f"❌ Analysis job submission failed.\nRaw: {an_raw[:500]}")
+                                        pipeline_status.update(label="❌ Analysis submission failed", state="error")
+                                    else:
+                                        plog(f"✅ Analysis job submitted - jobId={an_job_id}")
+                                        st.session_state["rms_analysis_job"] = {
+                                            "job_id": an_job_id, "status_url": "",
+                                            "host": job_info["host"], "api_key": job_info["api_key"],
+                                            "verify_ssl": job_info["verify_ssl"],
+                                            "portfolio_id": portfolio_id, "edm_name": edm_name_for_analysis,
+                                        }
+                                        plog("⏳ Analysis jobs can take significantly longer than import/geohaz - "
+                                             "not polling inline. Use 'Check analysis status' below to track progress.")
+                                        pipeline_status.update(
+                                            label="✅ Analysis submitted - check status below", state="complete")
+                except Exception as exc:
+                    plog(f"❌ Unexpected error: {exc}")
+                    pipeline_status.update(label="❌ Pipeline failed with an unexpected error", state="error")
+
+        if "rms_analysis_job" in st.session_state:
+            an_info = st.session_state["rms_analysis_job"]
+            st.divider()
+            st.markdown("#### C. Analysis status")
+            st.caption(f"Last submitted analysis job: **{an_info['job_id']}** for portfolio **{an_info['portfolio_id']}**")
+            if st.button("🔄 Check analysis status"):
+                check_api = RmsAnalysisApi(an_info["host"], an_info["api_key"], verify=an_info["verify_ssl"])
+                status, status_url, raw = check_api.check_analysis_status(
+                    an_info["job_id"], cached_status_url=an_info["status_url"])
+                an_info["status_url"] = status_url
+                st.session_state["rms_analysis_job"] = an_info
+                if is_success(status):
+                    st.success(f"✅ Status: {status} - analysis complete. Pull stats via the Analysis ID "
+                               f"using your existing RMS Analysis Total AAL tooling.")
+                elif status in ("FAILED", "CANCELLED", "ERROR"):
+                    st.error(f"❌ Status: {status}")
+                    with st.expander("Raw response"):
+                        st.code(raw[:2000])
+                else:
+                    st.info(f"⏳ Status: {status}")
