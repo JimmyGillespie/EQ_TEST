@@ -1176,10 +1176,17 @@ if "acc_df" in st.session_state:
                 latitude=mid_lat, longitude=mid_lon,
                 zoom=10 if len(map_df) > 1 else 13, pitch=0,
             )
+            # NOTE: map_provider defaults to "carto", which needs NO API token
+            # and renders reliably with no setup. An earlier version hardcoded
+            # a "mapbox://..." style URL, which silently requires a Mapbox
+            # API token to load any basemap tiles at all - without one, the
+            # map renders completely blank (no error, just empty). Carto's
+            # "light" style gives the same clean look with zero configuration.
             deck = pdk.Deck(
                 layers=[scatter_layer],
                 initial_view_state=view_state,
-                map_style="mapbox://styles/mapbox/light-v10",
+                map_provider="carto",
+                map_style="light",
                 tooltip={
                     "html": "<b>{label}</b><br/>CRESTA: {CRESTA}<br/>{Resolution Type}",
                     "style": {"backgroundColor": "#1f2937", "color": "white"},
