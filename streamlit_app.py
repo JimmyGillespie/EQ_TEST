@@ -53,6 +53,7 @@ from datetime import date, datetime, timezone
 from urllib.parse import urlsplit, quote
 
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -1000,20 +1001,29 @@ text_column_config = {field: st.column_config.TextColumn() for field in TEXT_FIE
 
 with st.form(key="main_form", clear_on_submit=False):
     st.subheader("1. Account Information")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        account_key = st.text_input("Account Key", placeholder="25M_1234")
-        layer_name = st.text_input("Layer Name", placeholder="25M")
-    with col2:
-        inception_date = st.date_input("Inception Date", value=date.today())
-        expiry_date = st.date_input("Expiry Date", value=date.today())
-    with col3:
-        underwriter = st.text_input("Underwriter Initials", placeholder="TR")
-        lob = st.text_input("Line of Business", placeholder="ANV_PacificPoint")
-    with col4:
-        eqsl_account = st.selectbox("EQSL Y/N", ["N", "Y"])
 
-    col5, col6, col7, col8, col9 = st.columns(5)
+    top1, top2, top3 = st.columns([2, 1, 1])
+    with top1:
+        account_key = st.text_input("Account Key", placeholder="25M_1234")
+    with top2:
+        inception_date = st.date_input("Inception Date", value=date.today())
+    with top3:
+        expiry_date = st.date_input("Expiry Date", value=date.today())
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        layer_name = st.text_input("Layer Name", placeholder="25M")
+        underwriter = st.text_input("Underwriter Initials", placeholder="TR")
+    with col2:
+        lob = st.text_input("Line of Business", placeholder="ANV_PacificPoint")
+        eqsl_account = st.selectbox("EQSL Y/N", ["N", "Y"])
+    with col3:
+        share_percent = st.number_input(
+            "Share (%)", value=100.0, step=5.0, min_value=0.0, max_value=1000.0, format="%.2f",
+            help="Participation share as a percentage - e.g. 100% for the full layer, 50% for half.",
+        )
+
+    col5, col6, col7, col8 = st.columns(4)
     with col5:
         premium = st.number_input("Premium", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
     with col6:
@@ -1022,9 +1032,13 @@ with st.form(key="main_form", clear_on_submit=False):
         attachment = st.number_input("Attachment", value=0, step=10000, min_value=0, max_value=LARGE_NUMBER_MAX)
     with col8:
         min_ded = st.number_input("Min Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
-    with col9:
-        max_ded = st.number_input("Max Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
-    share = st.number_input("Share", value=1.0, step=0.05, format="%.4f", min_value=0.0)
+    max_ded = st.number_input("Max Ded", value=0, step=1000, min_value=0, max_value=LARGE_NUMBER_MAX)
+
+    # Share is captured from the user as a percentage (e.g. 100%) but stored
+    # internally as a fraction (1.0), matching the source workbook's native
+    # Data!M3 "Share:" field and the ACC!BLANLIMAMT formula, which both
+    # expect a fraction, not a percentage.
+    share = share_percent / 100.0
 
     st.divider()
     st.subheader("2. Location Information")
@@ -1124,8 +1138,62 @@ if "acc_df" in st.session_state:
     preview_rows = st.session_state.get("preview_rows", [])
 
     if preview_rows:
-        with st.expander("🌍 Geocode Results (read-only)", expanded=True):
-            st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
+        preview_df = pd.DataFrame(preview_rows)
+
+        st.markdown("#### 🗺️ Location Map")
+        map_df = preview_df.copy()
+        map_df["Latitude"] = pd.to_numeric(map_df["Latitude"], errors="coerce")
+        map_df["Longitude"] = pd.to_numeric(map_df["Longitude"], errors="coerce")
+        map_df = map_df.dropna(subset=["Latitude", "Longitude"])
+
+        if not map_df.empty:
+            map_df["Geocoded OK"] = ~map_df["Resolution Type"].astype(str).str.startswith("ERROR")
+            map_df["fill_color"] = map_df["Geocoded OK"].apply(
+                lambda ok: [34, 139, 34, 200] if ok else [214, 39, 40, 200]
+            )
+            map_df["label"] = (
+                map_df["STREETNAME"].astype(str) + ", " + map_df["CITY"].astype(str)
+                + " (" + map_df["State (resolved)"].astype(str) + ")"
+            )
+
+            mid_lat = map_df["Latitude"].mean()
+            mid_lon = map_df["Longitude"].mean()
+
+            scatter_layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=map_df,
+                get_position="[Longitude, Latitude]",
+                get_fill_color="fill_color",
+                get_radius=250,
+                radius_min_pixels=6,
+                radius_max_pixels=20,
+                pickable=True,
+                stroked=True,
+                get_line_color=[255, 255, 255],
+                line_width_min_pixels=1,
+            )
+            view_state = pdk.ViewState(
+                latitude=mid_lat, longitude=mid_lon,
+                zoom=10 if len(map_df) > 1 else 13, pitch=0,
+            )
+            deck = pdk.Deck(
+                layers=[scatter_layer],
+                initial_view_state=view_state,
+                map_style="mapbox://styles/mapbox/light-v10",
+                tooltip={
+                    "html": "<b>{label}</b><br/>CRESTA: {CRESTA}<br/>{Resolution Type}",
+                    "style": {"backgroundColor": "#1f2937", "color": "white"},
+                },
+            )
+            st.pydeck_chart(deck)
+            legend_col1, legend_col2 = st.columns(2)
+            legend_col1.markdown("🟢 **Geocoded successfully**")
+            legend_col2.markdown("🔴 **Geocode failed** (see table below)")
+        else:
+            st.info("No locations have valid coordinates to plot yet.")
+
+        with st.expander("🌍 Geocode Results (read-only table)", expanded=True):
+            st.dataframe(preview_df, width="stretch", hide_index=True)
 
     tab1, tab2 = st.tabs(["ACC preview", "LOC preview"])
     with tab1:
@@ -1175,7 +1243,6 @@ else:
                 help="Matches the naming convention 'EDM-ANV_{Account Key}_Y{YY}' used by the source "
                      "workbook. Edit if your tenant uses a different convention.",
             )
-            import_currency = st.text_input("Currency", value="USD", key="import_currency")
         rms_import_verify_ssl = st.checkbox("Verify SSL", value=True, key="rms_import_verify_ssl")
         import_submitted = st.form_submit_button("🚀 Create EDM & Import to RMS", type="primary")
 
@@ -1237,7 +1304,7 @@ else:
                         else:
                             status_box.update(label="Step 4/5: Submitting import job...")
                             job_id, raw_resp = rms_api.submit_import_job(
-                                folder_id, exposure_id, portfolio_id, currency=import_currency.strip() or "USD",
+                                folder_id, exposure_id, portfolio_id, currency="USD",
                             )
                             if not job_id:
                                 log(f"❌ Import job submission failed.\nRaw response: {raw_resp[:500]}")
