@@ -307,17 +307,12 @@ PAGE_LIMIT = 1000
 
 
 def safe_get(obj, key):
-    """Case-insensitive-ish dict getter mirroring the VBA's LH_SafeGet,
-    simplified for the one use here (reading accountId)."""
     if not isinstance(obj, dict):
         return None
     return obj.get(key)
 
 
 def find_max_account_id(all_locations):
-    """Ported from LH_PullLocationsAndHazardsForAccount's maxAcct loop:
-    scans every location wrapper's location.property.accountId and
-    returns the highest numeric value found (or None if none are numeric)."""
     max_acct = None
     for lw in all_locations:
         location = (lw or {}).get("location") or {}
@@ -333,9 +328,6 @@ def find_max_account_id(all_locations):
 
 
 class ImportVerifier:
-    """Thin wrapper around the confirmed GET /exposures/{id}/locations
-    endpoint, used purely for counting the just-imported batch."""
-
     def __init__(self, host: str, api_key: str, verify: bool = True):
         self.host = host.strip()
         self.session = requests.Session()
@@ -370,9 +362,6 @@ class ImportVerifier:
             return None
 
     def fetch_all_locations(self, exposure_id: str) -> tuple[list, str]:
-        """Returns (list_of_location_wrappers, error_message_or_empty).
-        Paginates GET /exposures/{id}/locations exactly as the confirmed
-        macro does - NO portfolio scoping in the URL."""
         base = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/locations"
         all_locations = []
         offset = 0
@@ -381,7 +370,7 @@ class ImportVerifier:
             if status != 200:
                 if offset == 0:
                     return [], f"HTTP {status}: {text[:300]}"
-                break  # partial results already gathered - stop paginating
+                break
             parsed = self._safe_json(text)
             items = parsed if isinstance(parsed, list) else []
             if not items:
@@ -395,9 +384,6 @@ class ImportVerifier:
         return all_locations, ""
 
     def count_locations_for_latest_submission(self, exposure_id: str) -> tuple[int, str]:
-        """Returns (count, error_message). error_message is '' on success.
-        Counts only the locations belonging to the highest accountId
-        present under this exposure - i.e. the just-imported batch."""
         all_locations, error = self.fetch_all_locations(exposure_id)
         if error:
             return 0, error
@@ -406,8 +392,6 @@ class ImportVerifier:
 
         max_acct = find_max_account_id(all_locations)
         if max_acct is None:
-            # No location carried a numeric accountId at all - fall back
-            # to counting everything, since we can't distinguish batches.
             return len(all_locations), ""
 
         count = 0
@@ -425,10 +409,6 @@ class ImportVerifier:
 
 def verify_location_count(verifier: ImportVerifier, exposure_id: str, portfolio_id: str,
                            expected_count: int) -> dict:
-    """Returns a result dict with keys: expected, actual, match, error,
-    message - ready to render directly in a Streamlit UI. portfolio_id is
-    accepted for display/logging only - it is NOT used to scope the
-    query, since no confirmed portfolio-scoped locations endpoint exists."""
     actual_count, error = verifier.count_locations_for_latest_submission(exposure_id)
     if error:
         return {
@@ -1399,6 +1379,32 @@ with st.sidebar:
         "The Risk Data key (step 4) creates the EDM and submits the import job."
     )
     st.divider()
+
+    st.header("⚙️ Analysis Settings")
+    st.caption(
+        "Used by step 5's Geocode → Hazard → Analysis chain. Defaults are read from this "
+        "workbook's confirmed Controls!K1:M9 settings block - confirm these are correct for "
+        "this analysis before submitting, since a wrong Model Profile or Event Rate Scheme ID "
+        "will silently produce a wrong result."
+    )
+    model_profile_id = st.number_input(
+        "Model Profile ID", value=CONFIRMED_DEFAULTS["model_profile_id"], step=1)
+    event_rate_scheme_id = st.number_input(
+        "Event Rate Scheme ID", value=CONFIRMED_DEFAULTS["event_rate_scheme_id"], step=1)
+    output_profile_id = st.number_input(
+        "Output Profile ID", value=CONFIRMED_DEFAULTS["output_profile_id"], step=1)
+    vintage = st.text_input("Vintage", value=CONFIRMED_DEFAULTS["vintage"])
+    geohaz_engine_type = st.text_input("Geohaz Engine Type", value=CONFIRMED_DEFAULTS["geohaz_engine_type"])
+    geohaz_engine_version = st.text_input(
+        "Geohaz Engine Version", value=CONFIRMED_DEFAULTS["geohaz_engine_version"],
+        help="RMS requires one decimal place, e.g. '25.0' - never a bare '25'.")
+    hazard_layer_name = st.text_input("Hazard Layer Name", value=CONFIRMED_DEFAULTS["hazard_layer_name"])
+    skip_prev_geocoded = st.checkbox(
+        "Skip re-geocoding (locations already have Lat/Long)", value=True,
+        help="Matches AccountHasLatLong in the source macro - set False if any location is "
+             "missing coordinates and needs RMS to geocode it during this step.")
+
+    st.divider()
     if st.button("🔄 Reset location table", help="Clears all location rows back to a single blank row."):
         st.session_state["locations_df_seed"] = pd.DataFrame([LOCATION_INPUT_DEFAULTS.copy()])
         st.rerun()
@@ -1780,13 +1786,111 @@ else:
             else:
                 st.info(f"⏳ Status: {status}")
 
+
+# ==========================================================================
+# Non-blocking pipeline state machine (replaces blocking time.sleep polling)
+#
+# WHY: RMS's API only exposes GET-based job status endpoints (confirmed -
+# no webhook/websocket push), so SOME form of polling is unavoidable at the
+# protocol level. But polling via a blocking time.sleep() loop inside the
+# main Streamlit script run freezes that user's ENTIRE session for the full
+# wait (up to several minutes across geocode+hazard) - nothing on the page
+# can be clicked or viewed meanwhile. That's a Streamlit architecture
+# mismatch, not a Python limitation.
+#
+# FIX: advance_pipeline_once() performs exactly ONE non-blocking status
+# check + stage transition, and is called repeatedly by a st.fragment(
+# run_every=...) block in the UI - Streamlit's idiomatic mechanism for
+# auto-refreshing a small scoped part of the page on a timer while the
+# rest of the app stays fully interactive. This function is pure/testable
+# without Streamlit at all.
+# ==========================================================================
+
+def advance_pipeline_once(api, state, model_profile_id, event_rate_scheme_id, output_profile_id,
+                           vintage, geohaz_engine_type, geohaz_engine_version, hazard_layer_name):
+    """Performs one status check for the current stage and, if that stage
+    just reached a terminal state, either advances to the next stage
+    (submitting its job) or marks the pipeline as failed. Mutates and
+    returns `state` (a plain dict - see PIPELINE_STATE_DEFAULTS)."""
+    stage = state["stage"]
+
+    if stage == "geocode":
+        status, status_url, _ = api.check_geocode_status(
+            state["geo_job_id"], cached_status_url=state.get("geo_status_url", ""))
+        state["geo_status"] = status
+        state["geo_status_url"] = status_url
+        state["log"].append(f"Geocode status: {status}")
+        if is_terminal(status):
+            if is_success(status):
+                state["log"].append("✅ Geocode phase succeeded")
+                haz_job_id, haz_raw = api.submit_hazard_job(
+                    state["edm_name"], state["portfolio_id"], hazard_layer_name,
+                    geohaz_engine_type, geohaz_engine_version)
+                if haz_job_id:
+                    state["haz_job_id"] = haz_job_id
+                    state["stage"] = "hazard"
+                    state["log"].append(f"✅ Hazard job submitted - jobId={haz_job_id}")
+                else:
+                    state["stage"] = "failed"
+                    state["log"].append(f"❌ Hazard job submission failed: {haz_raw[:300]}")
+            else:
+                state["stage"] = "failed"
+                state["log"].append(f"❌ Geocode phase failed with status: {status}")
+
+    elif stage == "hazard":
+        status, status_url, _ = api.check_hazard_status(
+            state["haz_job_id"], cached_status_url=state.get("haz_status_url", ""))
+        state["haz_status"] = status
+        state["haz_status_url"] = status_url
+        state["log"].append(f"Hazard status: {status}")
+        if is_terminal(status):
+            if is_success(status):
+                state["log"].append("✅ Hazard phase succeeded")
+                an_job_id, an_raw = api.submit_analysis_job(
+                    state["edm_name"], state["portfolio_id"], model_profile_id,
+                    event_rate_scheme_id, output_profile_id, vintage)
+                if an_job_id:
+                    state["an_job_id"] = an_job_id
+                    state["stage"] = "analysis"
+                    state["log"].append(f"✅ Analysis job submitted - jobId={an_job_id}")
+                else:
+                    state["stage"] = "failed"
+                    state["log"].append(f"❌ Analysis job submission failed: {an_raw[:300]}")
+            else:
+                state["stage"] = "failed"
+                state["log"].append(f"❌ Hazard phase failed with status: {status}")
+
+    elif stage == "analysis":
+        status, status_url, _ = api.check_analysis_status(
+            state["an_job_id"], cached_status_url=state.get("an_status_url", ""))
+        state["an_status"] = status
+        state["an_status_url"] = status_url
+        state["log"].append(f"Analysis status: {status}")
+        if is_terminal(status):
+            state["stage"] = "done" if is_success(status) else "failed"
+            icon = "✅" if is_success(status) else "❌"
+            state["log"].append(f"{icon} Analysis phase ended with status: {status}")
+
+    return state
+
+
+def new_pipeline_state(edm_name, portfolio_id, host, api_key, verify_ssl, geo_job_id):
+    return {
+        "stage": "geocode", "edm_name": edm_name, "portfolio_id": portfolio_id,
+        "host": host, "api_key": api_key, "verify_ssl": verify_ssl,
+        "geo_job_id": geo_job_id, "geo_status": "", "geo_status_url": "",
+        "haz_job_id": "", "haz_status": "", "haz_status_url": "",
+        "an_job_id": "", "an_status": "", "an_status_url": "",
+        "log": [f"✅ Geocode job submitted - jobId={geo_job_id}"],
+    }
+
 st.divider()
 st.subheader("5. Verify Import & Run Analysis")
 st.caption(
     "Confirms every location landed in RMS, then runs the Geocode → Hazard → Analysis chain for "
-    "this portfolio. Ported from the confirmed-working modRMSImport.bas pipeline. Each stage must "
-    "succeed before the next becomes available - this is stricter than the source macro by design, "
-    "since submitting an analysis against an incomplete portfolio wastes real compute for a wrong answer."
+    "this portfolio. Ported from the confirmed-working modRMSImport.bas pipeline. Analysis "
+    "Settings are in the sidebar. Status is polled automatically in the background every few "
+    "seconds (via st.fragment) while this page stays fully interactive - no blocking waits."
 )
 
 if "rms_import_job" not in st.session_state:
@@ -1800,8 +1904,8 @@ else:
     if not portfolio_id:
         st.warning(
             "No portfolio was created during import (the job targeted the EDM directly) - "
-            "the geocode/hazard/analysis chain below requires a portfolio ID, so this step "
-            "cannot proceed. Re-run step 4 ensuring a portfolio is created."
+            "the geocode/hazard/analysis chain below requires a portfolio ID. Re-run step 4 "
+            "ensuring a portfolio is created."
         )
     else:
         st.markdown(f"**Portfolio:** `{portfolio_id}`  ·  **EDM:** `{edm_name_for_analysis}`  ·  "
@@ -1812,9 +1916,9 @@ else:
         expected_count = len(st.session_state.get("loc_df", pd.DataFrame()))
         st.caption(
             f"Expected: {expected_count} location(s), based on the LOC file built in step 3. "
-            f"Verification pulls every location under this exposure and counts the most recent "
-            f"(highest account ID) submission - there is no portfolio-scoped locations endpoint "
-            f"in RMS, so this mirrors the confirmed macro's own filtering approach."
+            f"Counts the most recent (highest account ID) submission under this exposure - "
+            f"there is no portfolio-scoped locations endpoint in RMS, so this mirrors the "
+            f"confirmed macro's own filtering approach."
         )
 
         if st.button("🔎 Verify locations imported"):
@@ -1836,143 +1940,83 @@ else:
 
         st.divider()
 
-        # ---- Stage B/C/D: Geocode -> Hazard -> Analysis ----
-        st.markdown("#### B. Geocode → Hazard → Analysis settings")
+        # ---- Stage B: Submit the chain (settings come from the sidebar) ----
+        st.markdown("#### B. Run Geocode → Hazard → Analysis")
         if not verification_passed:
-            st.info("🔒 Run and pass location verification above to unlock the analysis settings below.")
+            st.info("🔒 Run and pass location verification above to unlock submission below.")
         else:
-            with st.form(key="analysis_form", clear_on_submit=False):
-                st.caption(
-                    "Defaults below are read from this workbook's confirmed Controls!K1:M9 settings "
-                    "block. Confirm these are the correct IDs for this analysis before submitting - "
-                    "a wrong Model Profile or Event Rate Scheme ID will silently produce a wrong result."
+            already_running = "pipeline_state" in st.session_state and \
+                st.session_state["pipeline_state"]["stage"] not in ("done", "failed")
+
+            if already_running:
+                st.info(
+                    "A pipeline run is already in progress for this portfolio (see live status "
+                    "below) - submitting again is disabled to avoid duplicate analysis jobs."
                 )
-                ac1, ac2, ac3 = st.columns(3)
-                with ac1:
-                    model_profile_id = st.number_input(
-                        "Model Profile ID", value=CONFIRMED_DEFAULTS["model_profile_id"], step=1)
-                    event_rate_scheme_id = st.number_input(
-                        "Event Rate Scheme ID", value=CONFIRMED_DEFAULTS["event_rate_scheme_id"], step=1)
-                with ac2:
-                    output_profile_id = st.number_input(
-                        "Output Profile ID", value=CONFIRMED_DEFAULTS["output_profile_id"], step=1)
-                    vintage = st.text_input("Vintage", value=CONFIRMED_DEFAULTS["vintage"])
-                with ac3:
-                    geohaz_engine_type = st.text_input(
-                        "Geohaz Engine Type", value=CONFIRMED_DEFAULTS["geohaz_engine_type"])
-                    geohaz_engine_version = st.text_input(
-                        "Geohaz Engine Version", value=CONFIRMED_DEFAULTS["geohaz_engine_version"],
-                        help="RMS requires one decimal place, e.g. '25.0' - never a bare '25'.")
-                hazard_layer_name = st.text_input(
-                    "Hazard Layer Name", value=CONFIRMED_DEFAULTS["hazard_layer_name"])
-                skip_prev_geocoded = st.checkbox(
-                    "Skip re-geocoding (locations already have Lat/Long)", value=True,
-                    help="Matches AccountHasLatLong in the source macro - set False if any location "
-                         "is missing coordinates and needs RMS to geocode it during this step.")
-
-                run_pipeline_submitted = st.form_submit_button(
-                    "🚀 Submit Geocode → Hazard → Analysis", type="primary")
-
-            if run_pipeline_submitted:
+            submit_disabled = already_running
+            if st.button("🚀 Submit Geocode → Hazard → Analysis", type="primary", disabled=submit_disabled):
                 analysis_api = RmsAnalysisApi(job_info["host"], job_info["api_key"], verify=job_info["verify_ssl"])
-                pipeline_status = st.status("Running Geocode → Hazard → Analysis chain...", expanded=True)
-
-                def plog(msg):
-                    pipeline_status.write(msg)
-
-                try:
-                    pipeline_status.update(label="Stage 1/3: Submitting geocode job...")
+                with st.spinner("Submitting geocode job..."):
                     geo_job_id, geo_raw = analysis_api.submit_geocode_job(
                         edm_name_for_analysis, portfolio_id, geohaz_engine_type,
                         geohaz_engine_version, skip_prev_geocoded,
                     )
-                    if not geo_job_id:
-                        plog(f"❌ Geocode job submission failed.\nRaw: {geo_raw[:500]}")
-                        pipeline_status.update(label="❌ Geocode submission failed", state="error")
-                    else:
-                        plog(f"✅ Geocode job submitted - jobId={geo_job_id}")
-                        geo_status, geo_status_url = "UNKNOWN", ""
-                        for i in range(1, 25):
-                            time.sleep(5)
-                            geo_status, geo_status_url, _ = analysis_api.check_geocode_status(
-                                geo_job_id, cached_status_url=geo_status_url)
-                            plog(f"  Geocode poll {i}/24: {geo_status}")
-                            if is_terminal(geo_status):
-                                break
-
-                        if not is_success(geo_status):
-                            plog(f"❌ Geocode phase ended with status: {geo_status}")
-                            pipeline_status.update(label=f"❌ Geocode phase failed ({geo_status})", state="error")
-                        else:
-                            plog(f"✅ Geocode phase succeeded ({geo_status})")
-
-                            pipeline_status.update(label="Stage 2/3: Submitting hazard job...")
-                            haz_job_id, haz_raw = analysis_api.submit_hazard_job(
-                                edm_name_for_analysis, portfolio_id, hazard_layer_name,
-                                geohaz_engine_type, geohaz_engine_version,
-                            )
-                            if not haz_job_id:
-                                plog(f"❌ Hazard job submission failed.\nRaw: {haz_raw[:500]}")
-                                pipeline_status.update(label="❌ Hazard submission failed", state="error")
-                            else:
-                                plog(f"✅ Hazard job submitted - jobId={haz_job_id}")
-                                haz_status, haz_status_url = "UNKNOWN", ""
-                                for i in range(1, 25):
-                                    time.sleep(5)
-                                    haz_status, haz_status_url, _ = analysis_api.check_hazard_status(
-                                        haz_job_id, cached_status_url=haz_status_url)
-                                    plog(f"  Hazard poll {i}/24: {haz_status}")
-                                    if is_terminal(haz_status):
-                                        break
-
-                                if not is_success(haz_status):
-                                    plog(f"❌ Hazard phase ended with status: {haz_status}")
-                                    pipeline_status.update(label=f"❌ Hazard phase failed ({haz_status})", state="error")
-                                else:
-                                    plog(f"✅ Hazard phase succeeded ({haz_status})")
-
-                                    pipeline_status.update(label="Stage 3/3: Submitting analysis job...")
-                                    an_job_id, an_raw = analysis_api.submit_analysis_job(
-                                        edm_name_for_analysis, portfolio_id,
-                                        int(model_profile_id), int(event_rate_scheme_id),
-                                        int(output_profile_id), vintage.strip(),
-                                    )
-                                    if not an_job_id:
-                                        plog(f"❌ Analysis job submission failed.\nRaw: {an_raw[:500]}")
-                                        pipeline_status.update(label="❌ Analysis submission failed", state="error")
-                                    else:
-                                        plog(f"✅ Analysis job submitted - jobId={an_job_id}")
-                                        st.session_state["rms_analysis_job"] = {
-                                            "job_id": an_job_id, "status_url": "",
-                                            "host": job_info["host"], "api_key": job_info["api_key"],
-                                            "verify_ssl": job_info["verify_ssl"],
-                                            "portfolio_id": portfolio_id, "edm_name": edm_name_for_analysis,
-                                        }
-                                        plog("⏳ Analysis jobs can take significantly longer than import/geohaz - "
-                                             "not polling inline. Use 'Check analysis status' below to track progress.")
-                                        pipeline_status.update(
-                                            label="✅ Analysis submitted - check status below", state="complete")
-                except Exception as exc:
-                    plog(f"❌ Unexpected error: {exc}")
-                    pipeline_status.update(label="❌ Pipeline failed with an unexpected error", state="error")
-
-        if "rms_analysis_job" in st.session_state:
-            an_info = st.session_state["rms_analysis_job"]
-            st.divider()
-            st.markdown("#### C. Analysis status")
-            st.caption(f"Last submitted analysis job: **{an_info['job_id']}** for portfolio **{an_info['portfolio_id']}**")
-            if st.button("🔄 Check analysis status"):
-                check_api = RmsAnalysisApi(an_info["host"], an_info["api_key"], verify=an_info["verify_ssl"])
-                status, status_url, raw = check_api.check_analysis_status(
-                    an_info["job_id"], cached_status_url=an_info["status_url"])
-                an_info["status_url"] = status_url
-                st.session_state["rms_analysis_job"] = an_info
-                if is_success(status):
-                    st.success(f"✅ Status: {status} - analysis complete. Pull stats via the Analysis ID "
-                               f"using your existing RMS Analysis Total AAL tooling.")
-                elif status in ("FAILED", "CANCELLED", "ERROR"):
-                    st.error(f"❌ Status: {status}")
-                    with st.expander("Raw response"):
-                        st.code(raw[:2000])
+                if not geo_job_id:
+                    st.error(f"❌ Geocode job submission failed.\nRaw: {geo_raw[:500]}")
                 else:
-                    st.info(f"⏳ Status: {status}")
+                    st.session_state["pipeline_state"] = new_pipeline_state(
+                        edm_name_for_analysis, portfolio_id, job_info["host"], job_info["api_key"],
+                        job_info["verify_ssl"], geo_job_id,
+                    )
+                    st.rerun()
+
+        # ---- Stage C: Live status (non-blocking, auto-refreshing fragment) ----
+        if "pipeline_state" in st.session_state:
+            st.divider()
+            st.markdown("#### C. Live pipeline status")
+
+            STAGE_LABELS = {
+                "geocode": "⏳ Stage 1/3: Geocode running...",
+                "hazard": "⏳ Stage 2/3: Hazard running...",
+                "analysis": "⏳ Stage 3/3: Analysis running...",
+                "done": "✅ Pipeline complete!",
+                "failed": "❌ Pipeline failed",
+            }
+
+            @st.fragment(run_every="5s")
+            def render_pipeline_status():
+                state = st.session_state.get("pipeline_state")
+                if not state:
+                    return
+                if state["stage"] not in ("done", "failed"):
+                    api = RmsAnalysisApi(state["host"], state["api_key"], verify=state["verify_ssl"])
+                    state = advance_pipeline_once(
+                        api, state, model_profile_id, event_rate_scheme_id, output_profile_id,
+                        vintage, geohaz_engine_type, geohaz_engine_version, hazard_layer_name,
+                    )
+                    st.session_state["pipeline_state"] = state
+
+                label = STAGE_LABELS.get(state["stage"], state["stage"])
+                if state["stage"] == "done":
+                    st.success(label)
+                elif state["stage"] == "failed":
+                    st.error(label)
+                else:
+                    st.info(label)
+
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Geocode", state.get("geo_status") or "—")
+                p2.metric("Hazard", state.get("haz_status") or "—")
+                p3.metric("Analysis", state.get("an_status") or "—")
+
+                with st.expander("Detailed log", expanded=(state["stage"] in ("done", "failed"))):
+                    for line in state["log"]:
+                        st.write(line)
+
+                if state["stage"] == "done":
+                    st.caption(
+                        f"Analysis job **{state['an_job_id']}** completed. Pull stats via this "
+                        f"Analysis ID using your existing RMS Analysis Total AAL tooling."
+                    )
+
+            render_pipeline_status()
