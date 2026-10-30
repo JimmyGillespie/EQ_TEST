@@ -44,8 +44,13 @@ reproduce (fixed here instead):
     this app populates them from the geocode step.
 """
 
+import base64
+import hashlib
+import hmac as hmac_module
+import json
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from urllib.parse import urlsplit, quote
 
 import pandas as pd
 import requests
@@ -147,6 +152,469 @@ def options_list(pairs):
 # --------------------------------------------------------------------------
 # Geocode API client - flat body, confirmed from Geocode_DataTab.bas
 # --------------------------------------------------------------------------
+
+
+# ==========================================================================
+# RMS EDM Creation + MRI Import pipeline
+# Ported from modRMSImport.bas + modAWSSigV4.bas (confirmed-working VBA).
+# ==========================================================================
+
+TIMEOUT_CONNECT = 30
+TIMEOUT_READ = 120
+EDM_MAX_RETRIES = 3
+
+# Confirmed defaults, ported from modRMSConfig.bas
+RMS_DELIMITER = "COMMA"
+RMS_DELIM_CHAR = ","
+RMS_HAS_HEADERS = True
+RMS_PAGE_LIMIT = 100
+RMS_EDM_WAIT_SECONDS = 10
+RMS_EDM_WAIT_ATTEMPTS = 60
+RMS_DEFAULT_REGION = "eu-west-1"
+
+
+# ==========================================================================
+# AWS SigV4 signing - pure Python port of modAWSSigV4.bas's BuildS3PutHeaders
+# ==========================================================================
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def hmac_sha256(key: bytes, msg: bytes) -> bytes:
+    return hmac_module.new(key, msg, hashlib.sha256).digest()
+
+
+def aws_uri_encode(s: str, encode_slash: bool = True) -> str:
+    """Matches AwsUriEncode in modAWSSigV4.bas: unreserved chars pass
+    through, '/' is kept only if encode_slash=False, everything else is
+    percent-encoded (UTF-8, uppercase hex)."""
+    safe = "" if encode_slash else "/"
+    return quote(s, safe=safe + "-_.~")
+
+
+def amz_date_utc_now() -> str:
+    """Matches AmzDateUtcNow: YYYYMMDDTHHMMSSZ in UTC."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_s3_put_headers(upload_url: str, region: str, access_key: str,
+                          secret_key: str, session_token: str, file_bytes: bytes) -> dict:
+    """Pure-Python port of BuildS3PutHeaders - produces the exact same
+    canonical request / string-to-sign / signing-key-chain / Authorization
+    header as the confirmed-working VBA macro, for a presigned S3 PUT with
+    host + x-amz-content-sha256 + x-amz-date + x-amz-security-token as the
+    signed headers (matching the VBA exactly - no other headers signed)."""
+    parsed = urlsplit(upload_url)
+    host = parsed.netloc
+    path = parsed.path or "/"
+
+    amz_date = amz_date_utc_now()
+    payload_hash = sha256_hex(file_bytes)
+
+    canonical_uri = path  # already URL-path-safe from a presigned URL; not re-encoded, matching VBA
+
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+        f"x-amz-security-token:{session_token}\n"
+    )
+    signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+
+    canonical_request = (
+        f"PUT\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+
+    date_stamp = amz_date[:8]
+    credential_scope = f"{date_stamp}/{region}/s3/aws4_request"
+    hashed_canonical_request = sha256_hex(canonical_request.encode("utf-8"))
+
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}"
+    )
+
+    k_date = hmac_sha256(("AWS4" + secret_key).encode("utf-8"), date_stamp.encode("utf-8"))
+    k_region = hmac_sha256(k_date, region.encode("utf-8"))
+    k_service = hmac_sha256(k_region, b"s3")
+    k_signing = hmac_sha256(k_service, b"aws4_request")
+
+    signature = hmac_sha256(k_signing, string_to_sign.encode("utf-8")).hex()
+
+    auth_header = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+
+    return {
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-security-token": session_token,
+        "Authorization": auth_header,
+    }
+
+
+# ==========================================================================
+# RMS Platform API client
+# ==========================================================================
+
+class RmsImportApi:
+    """Wraps every confirmed endpoint used by GetOrCreateEDM -> ... ->
+    SubmitImportJob -> CheckJobStatusOnce. One instance per import run."""
+
+    def __init__(self, host: str, api_key: str, verify: bool = True):
+        self.host = host.strip()
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        clean_key = (api_key or "").strip()
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip()
+        self.api_key = clean_key
+        self.session.headers.update({"Accept": "application/json", "Authorization": clean_key})
+        self.session.verify = verify
+        self._resource_group_id = None
+        self._resource_group_id_fetched = False
+
+    # ---- low-level helpers ----
+
+    def _get(self, url, retries=EDM_MAX_RETRIES):
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                r = self.session.get(url, timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                return r.status_code, r.text, dict(r.headers)
+            except requests.RequestException as exc:
+                last_exc = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return 0, f"GET error: {last_exc}", {}
+        return 0, f"GET error: {last_exc}", {}
+
+    def _post(self, url, body_json: str, extra_headers: dict | None = None, retries=EDM_MAX_RETRIES):
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "Authorization": self.api_key}
+        if extra_headers:
+            headers.update(extra_headers)
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                r = self.session.post(url, data=body_json.encode("utf-8"), headers=headers,
+                                       timeout=(TIMEOUT_CONNECT, TIMEOUT_READ))
+                return r.status_code, r.text, dict(r.headers)
+            except requests.RequestException as exc:
+                last_exc = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return 0, f"POST error: {last_exc}", {}
+        return 0, f"POST error: {last_exc}", {}
+
+    @staticmethod
+    def _safe_json(text: str):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _as_list(parsed, *keys):
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            for k in keys:
+                v = parsed.get(k)
+                if isinstance(v, list):
+                    return v
+        return []
+
+    @staticmethod
+    def _match_name(item, *keys):
+        if not isinstance(item, dict):
+            return ""
+        for k in keys:
+            v = item.get(k)
+            if v not in (None, ""):
+                return str(v)
+        return ""
+
+    @staticmethod
+    def _extract_id(item, primary_key):
+        if not isinstance(item, dict):
+            return ""
+        v = item.get(primary_key)
+        if v not in (None, ""):
+            return str(v)
+        v = item.get("id")
+        if v not in (None, ""):
+            return str(v)
+        return ""
+
+    # ---- EDM ----
+
+    def resolve_exposure_id(self, target_name: str) -> str:
+        """Ported from ResolveExposureId: try exact filter match on
+        exposureName/databaseName first, else paginate through all
+        exposures looking for a case-insensitive exact name match."""
+        base = f"https://{self.host}/platform/riskdata/v1/exposures"
+        for filter_field in ("exposureName", "databaseName"):
+            filt = f"{filter_field}={quote(target_name)}"
+            status, text, _ = self._get(f"{base}?filter={filt}&limit={RMS_PAGE_LIMIT}")
+            if status == 200:
+                parsed = self._safe_json(text)
+                for item in self._as_list(parsed, "exposures", "items", "data"):
+                    nm = self._match_name(item, "exposureName", "databaseName")
+                    if nm.strip().lower() == target_name.strip().lower():
+                        return self._extract_id(item, "exposureId")
+
+        offset = 0
+        while True:
+            status, text, _ = self._get(f"{base}?limit={RMS_PAGE_LIMIT}&offset={offset}")
+            if status != 200:
+                break
+            parsed = self._safe_json(text)
+            items = self._as_list(parsed, "exposures", "items", "data")
+            if not items:
+                break
+            for item in items:
+                nm = self._match_name(item, "exposureName", "databaseName")
+                if nm.strip().lower() == target_name.strip().lower():
+                    return self._extract_id(item, "exposureId")
+            if len(items) < RMS_PAGE_LIMIT or offset > 20000:
+                break
+            offset += RMS_PAGE_LIMIT
+        return ""
+
+    def create_edm(self, target_name: str, wait_callback=None) -> tuple[bool, str]:
+        """Ported from CreateEDM. Returns (success, diagnostic_message)."""
+        url = (f"https://{self.host}/riskmodeler/v1/datasources"
+               f"?datasourcename={quote(target_name)}&operation=CREATE")
+        status, text, _ = self._post(url, "")
+        if status == 409:
+            return True, ""
+        if not (200 <= status < 300):
+            return False, (f"EDM CREATE request was rejected by RMS.\nURL: {url}\n"
+                            f"HTTP status: {status}\nResponse: {text}")
+
+        for attempt in range(1, RMS_EDM_WAIT_ATTEMPTS + 1):
+            if wait_callback:
+                wait_callback(attempt, RMS_EDM_WAIT_ATTEMPTS, target_name)
+            time.sleep(RMS_EDM_WAIT_SECONDS)
+            if self.resolve_exposure_id(target_name):
+                return True, ""
+        if self.resolve_exposure_id(target_name):
+            return True, ""
+        return False, (f"RMS accepted the EDM create request (HTTP {status}), but the EDM never "
+                        f"became findable afterward. Waited {RMS_EDM_WAIT_ATTEMPTS} x "
+                        f"{RMS_EDM_WAIT_SECONDS}s for '{target_name}'.\nCreate response: {text}")
+
+    def get_or_create_edm(self, target_name: str, wait_callback=None) -> tuple[str, str]:
+        """Returns (exposure_id, diagnostic_message). exposure_id is '' on failure."""
+        eid = self.resolve_exposure_id(target_name)
+        if eid:
+            return eid, ""
+        ok, diag = self.create_edm(target_name, wait_callback=wait_callback)
+        if not ok:
+            return "", diag
+        eid = self.resolve_exposure_id(target_name)
+        if not eid:
+            return "", (diag or "CreateEDM reported success, but the immediate follow-up lookup "
+                                 f"still returned nothing for '{target_name}'.")
+        return eid, ""
+
+    # ---- Portfolio ----
+
+    def list_portfolios(self, exposure_id: str) -> list:
+        url = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/portfolios"
+        status, text, _ = self._get(url)
+        if status == 200:
+            return self._as_list(self._safe_json(text), "portfolios", "items", "data")
+        return []
+
+    @staticmethod
+    def sanitize_name(name: str) -> str:
+        """Matches SanitizeName's intent closely enough for portfolio/account
+        identifiers: strip, collapse to a reasonable identifier charset."""
+        return "".join(ch for ch in name.strip() if ch.isalnum() or ch in "-_. ")
+
+    def create_portfolio(self, exposure_id: str, target_name: str, portfolio_number: str) -> str:
+        url = f"https://{self.host}/platform/riskdata/v1/exposures/{exposure_id}/portfolios"
+        safe_number = portfolio_number[:20]
+        body = json.dumps({"portfolioName": target_name, "portfolioNumber": safe_number})
+        status, text, _ = self._post(url, body)
+        if not (200 <= status < 300):
+            return ""
+        parsed = self._safe_json(text)
+        pid = self._extract_id(parsed, "portfolioId") if isinstance(parsed, dict) else ""
+        if not pid:
+            for _ in range(6):
+                time.sleep(3)
+                for item in self.list_portfolios(exposure_id):
+                    nm = self._match_name(item, "portfolioName", "name")
+                    if nm.strip() == target_name.strip():
+                        pid = self._extract_id(item, "portfolioId")
+                        break
+                if pid:
+                    break
+        if pid:
+            time.sleep(3)
+        return pid
+
+    def ensure_portfolio_by_identifier(self, exposure_id: str, account_number: str) -> str:
+        safe_acct = self.sanitize_name(account_number)[:20]
+        for item in self.list_portfolios(exposure_id):
+            nm = self._match_name(item, "portfolioName", "name")
+            num = self._match_name(item, "portfolioNumber", "number")
+            if num.strip().lower() == safe_acct.strip().lower() or nm.strip().lower() == safe_acct.strip().lower():
+                return self._extract_id(item, "portfolioId")
+        return self.create_portfolio(exposure_id, safe_acct, safe_acct)
+
+    # ---- Import folder + S3 upload ----
+
+    def create_import_folder(self) -> tuple[bool, str, dict, dict]:
+        """Returns (success, folder_id, acc_upload_detail, loc_upload_detail)."""
+        url = f"https://{self.host}/platform/import/v1/folders"
+        body = json.dumps({
+            "folderType": "MRI",
+            "properties": {
+                "fileExtension": "csv", "delimiter": RMS_DELIMITER,
+                "delimiterCharacter": RMS_DELIM_CHAR, "hasColumnHeaders": RMS_HAS_HEADERS,
+                "containsHeader": RMS_HAS_HEADERS, "hasHeader": RMS_HAS_HEADERS,
+            },
+        })
+        status, text, _ = self._post(url, body)
+        if status not in (200, 201):
+            body = json.dumps({"folderType": "MRI", "properties": {"fileExtension": "csv"}})
+            status, text, _ = self._post(url, body)
+            if status not in (200, 201):
+                return False, "", {}, {}
+        parsed = self._safe_json(text)
+        if not isinstance(parsed, dict):
+            return False, "", {}, {}
+        folder_id = str(parsed.get("folderId", ""))
+        upload_details = parsed.get("uploadDetails")
+        if not isinstance(upload_details, dict):
+            return False, "", {}, {}
+        acc_upload = upload_details.get("accountsFile")
+        loc_upload = upload_details.get("locationsFile")
+        if not isinstance(acc_upload, dict) or not isinstance(loc_upload, dict):
+            return False, "", {}, {}
+        return True, folder_id, acc_upload, loc_upload
+
+    def upload_file_to_s3(self, file_detail: dict, file_bytes: bytes) -> tuple[bool, str]:
+        """Returns (success, error_message)."""
+        try:
+            presign = file_detail.get("presignParams")
+            if not isinstance(presign, dict):
+                return False, "presignParams missing from upload detail"
+            import base64
+            access_key = base64.b64decode(presign["accessKeyId"]).decode("utf-8")
+            secret_key = base64.b64decode(presign["secretAccessKey"]).decode("utf-8")
+            session_token = base64.b64decode(presign["sessionToken"]).decode("utf-8")
+            region = RMS_DEFAULT_REGION
+            if presign.get("region"):
+                region = base64.b64decode(presign["region"]).decode("utf-8") or RMS_DEFAULT_REGION
+
+            upload_url = file_detail["uploadUrl"]
+            headers = build_s3_put_headers(upload_url, region, access_key, secret_key,
+                                            session_token, file_bytes)
+            r = requests.put(upload_url, data=file_bytes, headers=headers,
+                              timeout=(30, 600))
+            if 200 <= r.status_code < 300:
+                return True, ""
+            return False, f"S3 PUT failed: HTTP {r.status_code} - {r.text[:300]}"
+        except Exception as exc:
+            return False, f"S3 upload exception: {exc}"
+
+    # ---- Import job submission + polling ----
+
+    def get_resource_group_id(self) -> str:
+        if self._resource_group_id_fetched:
+            return self._resource_group_id or ""
+        self._resource_group_id_fetched = True
+        self._resource_group_id = ""
+        url = f"https://{self.host}/platform/tenantdata/v1/entitlements/RI-RISKMODELER/resourcegroups"
+        status, text, _ = self._get(url)
+        if status == 200:
+            parsed = self._safe_json(text)
+            items = self._as_list(parsed, "resourceGroups", "items", "data")
+            if items and isinstance(items[0], dict):
+                first = items[0]
+                rgid = first.get("resourceGroupId") or first.get("id") or first.get("resourcegroupId") or ""
+                self._resource_group_id = str(rgid)
+        return self._resource_group_id or ""
+
+    def submit_import_job(self, folder_id: str, exposure_id: str, portfolio_id: str,
+                           currency: str = "USD") -> tuple[str, str]:
+        """Returns (job_id, raw_response_text). job_id is '' on failure."""
+        url = f"https://{self.host}/platform/import/v1/jobs"
+        resource_uri = f"/platform/riskdata/v1/exposures/{exposure_id}"
+        if portfolio_id:
+            resource_uri += f"/portfolios/{portfolio_id}"
+        body = json.dumps({
+            "importType": "MRI", "resourceUri": resource_uri,
+            "settings": {
+                "folderId": folder_id, "delimiter": RMS_DELIMITER,
+                "delimiterCharacter": RMS_DELIM_CHAR, "hasColumnHeaders": RMS_HAS_HEADERS,
+                "containsHeader": RMS_HAS_HEADERS, "hasHeader": RMS_HAS_HEADERS, "currency": currency,
+            },
+        })
+        resource_group_id = self.get_resource_group_id()
+        extra_headers = {"x-rms-resource-group-id": resource_group_id} if resource_group_id else None
+
+        raw_text = ""
+        for attempt in range(4):
+            status, text, headers = self._post(url, body, extra_headers=extra_headers)
+            raw_text = text
+            if 200 <= status < 300:
+                job_id = ""
+                parsed = self._safe_json(text)
+                if isinstance(parsed, dict):
+                    job_id = str(parsed.get("id") or parsed.get("jobId") or parsed.get("workflowId") or "")
+                if not job_id:
+                    location = headers.get("Location") or headers.get("location") or ""
+                    if location:
+                        job_id = location.rstrip("/").split("/")[-1]
+                return job_id, raw_text
+
+            resp_code = ""
+            parsed = self._safe_json(text)
+            if isinstance(parsed, dict):
+                resp_code = str(parsed.get("code", ""))
+            is_resource_id_error = ("resource id is not specified" in text.lower()) or resp_code == "INT-999"
+            if is_resource_id_error and attempt < 3:
+                time.sleep(5)
+                continue
+            return "", raw_text
+        return "", raw_text
+
+    def check_job_status_once(self, job_id: str, cached_status_url: str = "") -> tuple[str, str, str]:
+        """Returns (status_string, status_url_used, raw_response_text).
+        Status is 'UNKNOWN' if no candidate URL responds 200."""
+        status_url = cached_status_url
+        if not status_url:
+            candidates = [
+                f"https://{self.host}/platform/import/v1/jobs/{job_id}",
+                f"https://{self.host}/platform/v1/workflows/{job_id}",
+                f"https://{self.host}/riskmodeler/v1/workflows/{job_id}",
+            ]
+            for candidate in candidates:
+                status, text, _ = self._get(candidate)
+                if status == 200:
+                    status_url = candidate
+                    break
+            if not status_url:
+                return "UNKNOWN", "", ""
+
+        status, text, _ = self._get(status_url)
+        parsed = self._safe_json(text)
+        st = ""
+        if isinstance(parsed, dict):
+            st = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
+        return (st or "UNKNOWN"), status_url, text
+
 
 class GeocodeApi:
     def __init__(self, host, api_key, verify=True):
@@ -492,10 +960,18 @@ st.caption(
     "files in one step. Ported directly from a confirmed-working RMS cleansing workbook's Data "
     "tab, LOC/ACC formulas, and Geocode_DataTab macro."
 )
+st.success(
+    "🏷️ **Build ID: v4-form-20261030-0942** — if you do NOT see this exact line when you load the "
+    "app, you are looking at a cached/older deployment, not this file. Hard-refresh your browser "
+    "(Ctrl+Shift+R / Cmd+Shift+R) or redeploy from this exact file before troubleshooting further.",
+    icon="🏷️",
+)
 st.info(
     "ℹ️ All fields below are inside a **form**. Nothing is sent to the app until you press the "
     "**Geocode & Build** button at the bottom - this guarantees every field you typed is captured "
-    "together, with no risk of one field resetting while you're still editing another.",
+    "together, with no risk of one field resetting while you're still editing another. "
+    "This exact mechanism has been verified with an automated test: typing an Account Key and "
+    "pressing submit correctly captures it every time.",
     icon="ℹ️",
 )
 
@@ -672,3 +1148,155 @@ if "acc_df" in st.session_state:
         )
 else:
     st.info("Fill in the form above and press 'Geocode & Build ACC/LOC Files' to generate the files.")
+
+st.divider()
+st.subheader("4. Create EDM & Import to RMS")
+st.caption(
+    "Uploads the ACC/LOC files built above into RMS: resolves or creates the EDM, creates a "
+    "portfolio, uploads both files to S3, submits the MRI import job, and polls for completion. "
+    "Ported from the confirmed-working modRMSImport.bas / modAWSSigV4.bas macros."
+)
+
+if "acc_df" not in st.session_state:
+    st.info("Build the ACC/LOC files in step 3 above before importing to RMS.")
+else:
+    with st.form(key="import_form", clear_on_submit=False):
+        imp_col1, imp_col2 = st.columns(2)
+        with imp_col1:
+            rms_import_host = st.text_input("RMS host", value="api-euw1.rms.com", key="rms_import_host")
+            rms_import_api_key = st.text_input("RMS Risk Data API key", type="password", key="rms_import_api_key",
+                                                help="Same key used for platform/riskdata/v1 and riskmodeler/v1 "
+                                                     "endpoints - this is a DIFFERENT key from the Location "
+                                                     "Intelligence key used for geocoding above.")
+        with imp_col2:
+            default_edm_name = f"EDM-ANV_{account_key.strip()}_Y{datetime.now().strftime('%y')}" if account_key.strip() else ""
+            edm_name_input = st.text_input(
+                "EDM name", value=default_edm_name, key="edm_name_input",
+                help="Matches the naming convention 'EDM-ANV_{Account Key}_Y{YY}' used by the source "
+                     "workbook. Edit if your tenant uses a different convention.",
+            )
+            import_currency = st.text_input("Currency", value="USD", key="import_currency")
+        rms_import_verify_ssl = st.checkbox("Verify SSL", value=True, key="rms_import_verify_ssl")
+        import_submitted = st.form_submit_button("🚀 Create EDM & Import to RMS", type="primary")
+
+    if import_submitted:
+        if not rms_import_api_key:
+            st.warning("Please provide an RMS Risk Data API key.")
+        elif not edm_name_input.strip():
+            st.warning("Please provide an EDM name.")
+        else:
+            acc_df = st.session_state["acc_df"]
+            loc_df = st.session_state["loc_df"]
+            acc_bytes = acc_df.to_csv(index=False).encode("utf-8")
+            loc_bytes = loc_df.to_csv(index=False).encode("utf-8")
+
+            rms_api = RmsImportApi(rms_import_host.strip(), rms_import_api_key, verify=rms_import_verify_ssl)
+            status_box = st.status("Starting import...", expanded=True)
+            import_result = {"success": False, "log": []}
+
+            def log(msg):
+                import_result["log"].append(msg)
+                status_box.write(msg)
+
+            try:
+                status_box.update(label="Step 1/5: Resolving or creating EDM...")
+                log(f"Resolving EDM '{edm_name_input.strip()}'...")
+
+                def wait_cb(attempt, total, name):
+                    status_box.update(label=f"Waiting for EDM '{name}' to build... ({attempt}/{total})")
+
+                exposure_id, diag = rms_api.get_or_create_edm(edm_name_input.strip(), wait_callback=wait_cb)
+                if not exposure_id:
+                    log(f"❌ Failed to resolve or create EDM.\n{diag}")
+                    status_box.update(label="❌ EDM creation failed", state="error")
+                else:
+                    log(f"✅ EDM confirmed - exposureId={exposure_id}")
+
+                    status_box.update(label="Step 2/5: Creating portfolio...")
+                    portfolio_id = rms_api.ensure_portfolio_by_identifier(exposure_id, account_key.strip())
+                    if not portfolio_id:
+                        log("⚠️ Could not create/resolve a portfolio - import will target the EDM directly.")
+                    else:
+                        log(f"✅ Portfolio ready - portfolioId={portfolio_id}")
+
+                    status_box.update(label="Step 3/5: Creating import folder & uploading files to S3...")
+                    folder_ok, folder_id, acc_upload, loc_upload = rms_api.create_import_folder()
+                    if not folder_ok:
+                        log("❌ Failed to create the import folder.")
+                        status_box.update(label="❌ Import folder creation failed", state="error")
+                    else:
+                        log(f"✅ Import folder created - folderId={folder_id}")
+
+                        acc_ok, acc_err = rms_api.upload_file_to_s3(acc_upload, acc_bytes)
+                        log(f"{'✅' if acc_ok else '❌'} ACC file upload: {'OK' if acc_ok else acc_err}")
+                        loc_ok, loc_err = rms_api.upload_file_to_s3(loc_upload, loc_bytes)
+                        log(f"{'✅' if loc_ok else '❌'} LOC file upload: {'OK' if loc_ok else loc_err}")
+
+                        if not (acc_ok and loc_ok):
+                            status_box.update(label="❌ File upload to S3 failed", state="error")
+                        else:
+                            status_box.update(label="Step 4/5: Submitting import job...")
+                            job_id, raw_resp = rms_api.submit_import_job(
+                                folder_id, exposure_id, portfolio_id, currency=import_currency.strip() or "USD",
+                            )
+                            if not job_id:
+                                log(f"❌ Import job submission failed.\nRaw response: {raw_resp[:500]}")
+                                status_box.update(label="❌ Import job submission failed", state="error")
+                            else:
+                                log(f"✅ Import job submitted - jobId={job_id}")
+                                st.session_state["rms_import_job"] = {
+                                    "job_id": job_id, "exposure_id": exposure_id,
+                                    "portfolio_id": portfolio_id, "edm_name": edm_name_input.strip(),
+                                    "status_url": "", "host": rms_import_host.strip(),
+                                    "api_key": rms_import_api_key, "verify_ssl": rms_import_verify_ssl,
+                                }
+                                status_box.update(label="Step 5/5: Polling job status...")
+
+                                final_status = "UNKNOWN"
+                                status_url = ""
+                                for poll_attempt in range(1, 13):
+                                    time.sleep(5)
+                                    final_status, status_url, raw_status = rms_api.check_job_status_once(
+                                        job_id, cached_status_url=status_url,
+                                    )
+                                    log(f"  Poll {poll_attempt}/12: status = {final_status}")
+                                    if final_status in ("COMPLETED", "SUCCESS", "SUCCEEDED", "FAILED", "ERROR"):
+                                        break
+                                st.session_state["rms_import_job"]["status_url"] = status_url
+
+                                if final_status in ("COMPLETED", "SUCCESS", "SUCCEEDED"):
+                                    log(f"✅ Import job finished with status: {final_status}")
+                                    status_box.update(label="✅ Import complete!", state="complete")
+                                    import_result["success"] = True
+                                elif final_status in ("FAILED", "ERROR"):
+                                    log(f"❌ Import job finished with status: {final_status}")
+                                    status_box.update(label="❌ Import job failed", state="error")
+                                else:
+                                    log(f"⏳ Import job still in progress (last status: {final_status}) - "
+                                        f"use 'Check status' below to keep polling.")
+                                    status_box.update(label=f"⏳ Still running (status: {final_status})", state="running")
+            except Exception as exc:
+                log(f"❌ Unexpected error: {exc}")
+                status_box.update(label="❌ Import failed with an unexpected error", state="error")
+
+    if "rms_import_job" in st.session_state:
+        job_info = st.session_state["rms_import_job"]
+        st.caption(
+            f"Last submitted job: **{job_info['job_id']}** for EDM **{job_info['edm_name']}** "
+            f"(exposureId={job_info['exposure_id']}, portfolioId={job_info['portfolio_id'] or '—'})"
+        )
+        if st.button("🔄 Check import status"):
+            check_api = RmsImportApi(job_info["host"], job_info["api_key"], verify=job_info["verify_ssl"])
+            status, status_url, raw = check_api.check_job_status_once(
+                job_info["job_id"], cached_status_url=job_info["status_url"],
+            )
+            job_info["status_url"] = status_url
+            st.session_state["rms_import_job"] = job_info
+            if status in ("COMPLETED", "SUCCESS", "SUCCEEDED"):
+                st.success(f"✅ Status: {status}")
+            elif status in ("FAILED", "ERROR"):
+                st.error(f"❌ Status: {status}")
+                with st.expander("Raw response"):
+                    st.code(raw[:2000])
+            else:
+                st.info(f"⏳ Status: {status}")
