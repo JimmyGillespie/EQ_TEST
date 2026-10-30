@@ -138,6 +138,41 @@ RESOLUTION_LABELS = {
     12:"Multiple",13:"User Defined",14:"Country",
 }
 
+# Map marker color by geocode precision tier (lower code = more precise).
+# Source: RMS_EDM.Lookup.GeoResolutionCode, same confirmed scale as
+# RESOLUTION_LABELS above. RGBA, 200 = slightly transparent.
+RESOLUTION_COLOR = {
+    1: [34, 139, 34, 200],    # Coordinate - dark green (best)
+    2: [34, 139, 34, 200],    # Parcel - dark green
+    3: [102, 189, 60, 200],   # Street Block - green
+    4: [154, 205, 50, 200],   # Street Name - yellow-green
+    5: [255, 193, 7, 200],    # Postcode - amber
+    6: [255, 152, 0, 200],    # City District - orange
+    7: [255, 152, 0, 200],    # City - orange
+    8: [255, 87, 34, 200],    # District - deep orange
+    9: [220, 53, 69, 200],    # County - red
+    10: [178, 34, 52, 200],   # State - dark red
+    11: [178, 34, 52, 200],   # Accumulation Zone - dark red
+    12: [128, 0, 128, 200],   # Multiple - purple (ambiguous match)
+    13: [128, 128, 128, 200], # User Defined - grey
+    14: [96, 96, 96, 200],    # Country - dark grey (worst)
+    0: [96, 96, 96, 200],     # None - dark grey
+}
+RESOLUTION_COLOR_ERROR = [214, 39, 40, 220]  # bright red - geocode call failed outright
+
+
+def resolution_marker_color(resolution_code, geocoded_ok):
+    """Returns an RGBA color list for a map marker based on geocode
+    precision. Failed lookups (no coordinates at all) are always bright
+    red, regardless of resolution code."""
+    if not geocoded_ok:
+        return RESOLUTION_COLOR_ERROR
+    try:
+        code_int = int(resolution_code)
+    except (TypeError, ValueError):
+        return RESOLUTION_COLOR[0]
+    return RESOLUTION_COLOR.get(code_int, RESOLUTION_COLOR[0])
+
 
 def desc_to_code(pairs, description):
     for code, desc in pairs:
@@ -926,6 +961,7 @@ def geocode_and_build(api, account, locations_df):
             "STREETNAME": street, "CITY": loc_dict.get("CITY", ""),
             "STATE (typed)": loc_dict.get("STATE", ""), "ZIPCODE": loc_dict.get("ZIPCODE", ""),
             "Latitude": geocode_fields["Latitude"], "Longitude": geocode_fields["Longitude"],
+            "Resolution Code": geocode_fields["Resolution Code"],
             "Resolution Type": geocode_fields["Resolution Type"],
             "State (resolved)": geocode_fields["State Helper"],
             "County (resolved)": geocode_fields["County Helper"],
@@ -980,13 +1016,20 @@ if "locations_df_seed" not in st.session_state:
     st.session_state["locations_df_seed"] = pd.DataFrame([LOCATION_INPUT_DEFAULTS.copy()])
 
 with st.sidebar:
-    st.header("Geocode connection")
-    host = st.text_input("Host", value="api-euw1.rms.com")
-    api_key = st.text_input("Location Intelligence API key", type="password")
+    st.header("RMS Connection")
+    host = st.text_input("Host", value="api-euw1.rms.com",
+                          help="Shared by both APIs below - this is your tenant's RMS host.")
+    api_key = st.text_input("Location Intelligence API key", type="password",
+                             help="Used for geocoding (step 3) - Location Intelligence (li/*) endpoints.")
+    rms_import_api_key = st.text_input("RMS Risk Data API key", type="password",
+                                        help="Used for Create EDM & Import (step 4) - platform/riskdata/v1 "
+                                             "and riskmodeler/v1 endpoints. A DIFFERENT key from the one above.")
     verify_ssl = st.checkbox("Verify SSL", value=True)
+    rms_import_verify_ssl = verify_ssl
+    rms_import_host = host
     st.caption(
-        "Geocoding resolves each address to Latitude/Longitude, State/County/CRESTA - this "
-        "happens automatically as part of the combined Geocode & Build action."
+        "Geocoding (step 3) resolves each address to Latitude/Longitude, State/County/CRESTA. "
+        "The Risk Data key (step 4) creates the EDM and submits the import job."
     )
     st.divider()
     if st.button("🔄 Reset location table", help="Clears all location rows back to a single blank row."):
@@ -1148,8 +1191,8 @@ if "acc_df" in st.session_state:
 
         if not map_df.empty:
             map_df["Geocoded OK"] = ~map_df["Resolution Type"].astype(str).str.startswith("ERROR")
-            map_df["fill_color"] = map_df["Geocoded OK"].apply(
-                lambda ok: [34, 139, 34, 200] if ok else [214, 39, 40, 200]
+            map_df["fill_color"] = map_df.apply(
+                lambda r: resolution_marker_color(r["Resolution Code"], r["Geocoded OK"]), axis=1
             )
             map_df["label"] = (
                 map_df["STREETNAME"].astype(str) + ", " + map_df["CITY"].astype(str)
@@ -1193,9 +1236,12 @@ if "acc_df" in st.session_state:
                 },
             )
             st.pydeck_chart(deck)
-            legend_col1, legend_col2 = st.columns(2)
-            legend_col1.markdown("🟢 **Geocoded successfully**")
-            legend_col2.markdown("🔴 **Geocode failed** (see table below)")
+            st.caption(
+                "Marker color = geocode precision: "
+                "🟢 Coordinate/Parcel/Street-level (best) · 🟠 Postcode/City-level · "
+                "🔴 County/State/Country-level (coarse) or geocode failed · "
+                "⚪ Ambiguous/unknown match. Hover a marker for details."
+            )
         else:
             st.info("No locations have valid coordinates to plot yet.")
 
@@ -1236,21 +1282,13 @@ if "acc_df" not in st.session_state:
     st.info("Build the ACC/LOC files in step 3 above before importing to RMS.")
 else:
     with st.form(key="import_form", clear_on_submit=False):
-        imp_col1, imp_col2 = st.columns(2)
-        with imp_col1:
-            rms_import_host = st.text_input("RMS host", value="api-euw1.rms.com", key="rms_import_host")
-            rms_import_api_key = st.text_input("RMS Risk Data API key", type="password", key="rms_import_api_key",
-                                                help="Same key used for platform/riskdata/v1 and riskmodeler/v1 "
-                                                     "endpoints - this is a DIFFERENT key from the Location "
-                                                     "Intelligence key used for geocoding above.")
-        with imp_col2:
-            default_edm_name = f"EDM-ANV_{account_key.strip()}_Y{datetime.now().strftime('%y')}" if account_key.strip() else ""
-            edm_name_input = st.text_input(
-                "EDM name", value=default_edm_name, key="edm_name_input",
-                help="Matches the naming convention 'EDM-ANV_{Account Key}_Y{YY}' used by the source "
-                     "workbook. Edit if your tenant uses a different convention.",
-            )
-        rms_import_verify_ssl = st.checkbox("Verify SSL", value=True, key="rms_import_verify_ssl")
+        default_edm_name = f"EDM-ANV_{account_key.strip()}_Y{datetime.now().strftime('%y')}" if account_key.strip() else ""
+        edm_name_input = st.text_input(
+            "EDM name", value=default_edm_name, key="edm_name_input",
+            help="Matches the naming convention 'EDM-ANV_{Account Key}_Y{YY}' used by the source "
+                 "workbook. Edit if your tenant uses a different convention. Host and API key are "
+                 "set in the sidebar.",
+        )
         import_submitted = st.form_submit_button("🚀 Create EDM & Import to RMS", type="primary")
 
     if import_submitted:
