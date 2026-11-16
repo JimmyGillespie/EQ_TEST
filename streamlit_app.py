@@ -1,10 +1,24 @@
 #!/usr/bin/env python
 """
-RMS LOC/ACC File Builder (Streamlit) - v4
+RMS LOC/ACC File Builder (Streamlit) - v5
 
 Ports the "Data" tab + its live formulas (LOC/ACC sheets) + Geocode_DataTab.bas
 macro from a confirmed-working RMS cleansing workbook into a single Streamlit
-data-entry app. Produces RMS-import-ready ACC and LOC CSV files.
+data-entry app. Produces RMS-import-ready ACC and LOC CSV files, imports them
+into RMS, runs Geocode -> Hazard -> Analysis, and (v5) pulls the results.
+
+v5 CHANGES
+-----------------------------------------------------
+  - Step 5's pipeline now keeps the raw workflow response of the analysis job
+    in state["an_raw"] so Step 6 can find the analysis id.
+  - Step 5's live-status fragment triggers ONE full-page rerun when the
+    pipeline reaches done/failed, so Step 6 unlocks immediately (a fragment
+    rerun on its own would leave the rest of the page stale).
+  - NEW Step 6 (rms_results_ui.render_results_step): EP + stats, RDS events,
+    Top Locations, Locations + hazards, Marginal Impact (grouping job) and the
+    Report Summary workbook download.
+    Requires rms_results.py, rms_workbook.py, rms_results_ui.py in the same
+    folder and `openpyxl` in requirements.txt.
 
 ARCHITECTURE NOTE - v4 fix for the real root cause
 -----------------------------------------------------
@@ -57,6 +71,8 @@ import pydeck as pdk
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
+
+from rms_results_ui import render_results_step
 
 TIMEOUT = 60
 MAX_RETRIES = 4
@@ -608,10 +624,10 @@ class RmsAnalysisApi:
                 return "UNKNOWN", "", ""
         status, text = self._get(status_url)
         parsed = self._safe_json(text)
-        st = ""
+        st_value = ""
         if isinstance(parsed, dict):
-            st = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
-        return (st or "UNKNOWN"), status_url, text
+            st_value = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
+        return (st_value or "UNKNOWN"), status_url, text
 
     def check_geocode_status(self, job_id: str, cached_status_url: str = ""):
         candidates = [
@@ -892,7 +908,6 @@ class RmsImportApi:
             presign = file_detail.get("presignParams")
             if not isinstance(presign, dict):
                 return False, "presignParams missing from upload detail"
-            import base64
             access_key = base64.b64decode(presign["accessKeyId"]).decode("utf-8")
             secret_key = base64.b64decode(presign["secretAccessKey"]).decode("utf-8")
             session_token = base64.b64decode(presign["sessionToken"]).decode("utf-8")
@@ -993,10 +1008,10 @@ class RmsImportApi:
 
         status, text, _ = self._get(status_url)
         parsed = self._safe_json(text)
-        st = ""
+        st_value = ""
         if isinstance(parsed, dict):
-            st = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
-        return (st or "UNKNOWN"), status_url, text
+            st_value = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
+        return (st_value or "UNKNOWN"), status_url, text
 
 
 class GeocodeApi:
@@ -1345,7 +1360,7 @@ st.caption(
     "tab, LOC/ACC formulas, and Geocode_DataTab macro."
 )
 st.success(
-    "🏷️ **Build ID: v4-form-20261030-0942** — if you do NOT see this exact line when you load the "
+    "🏷️ **Build ID: v5-results-20261116** — if you do NOT see this exact line when you load the "
     "app, you are looking at a cached/older deployment, not this file. Hard-refresh your browser "
     "(Ctrl+Shift+R / Cmd+Shift+R) or redeploy from this exact file before troubleshooting further.",
     icon="🏷️",
@@ -1811,7 +1826,7 @@ def advance_pipeline_once(api, state, model_profile_id, event_rate_scheme_id, ou
     """Performs one status check for the current stage and, if that stage
     just reached a terminal state, either advances to the next stage
     (submitting its job) or marks the pipeline as failed. Mutates and
-    returns `state` (a plain dict - see PIPELINE_STATE_DEFAULTS)."""
+    returns `state` (a plain dict - see new_pipeline_state)."""
     stage = state["stage"]
 
     if stage == "geocode":
@@ -1861,8 +1876,10 @@ def advance_pipeline_once(api, state, model_profile_id, event_rate_scheme_id, ou
                 state["log"].append(f"❌ Hazard phase failed with status: {status}")
 
     elif stage == "analysis":
-        status, status_url, _ = api.check_analysis_status(
+        # v5: keep the raw workflow response - Step 6 mines it for the analysis id.
+        status, status_url, raw = api.check_analysis_status(
             state["an_job_id"], cached_status_url=state.get("an_status_url", ""))
+        state["an_raw"] = raw
         state["an_status"] = status
         state["an_status_url"] = status_url
         state["log"].append(f"Analysis status: {status}")
@@ -1880,7 +1897,7 @@ def new_pipeline_state(edm_name, portfolio_id, host, api_key, verify_ssl, geo_jo
         "host": host, "api_key": api_key, "verify_ssl": verify_ssl,
         "geo_job_id": geo_job_id, "geo_status": "", "geo_status_url": "",
         "haz_job_id": "", "haz_status": "", "haz_status_url": "",
-        "an_job_id": "", "an_status": "", "an_status_url": "",
+        "an_job_id": "", "an_status": "", "an_status_url": "", "an_raw": "",
         "log": [f"✅ Geocode job submitted - jobId={geo_job_id}"],
     }
 
@@ -1989,12 +2006,18 @@ else:
                 if not state:
                     return
                 if state["stage"] not in ("done", "failed"):
+                    prev_stage = state["stage"]
                     api = RmsAnalysisApi(state["host"], state["api_key"], verify=state["verify_ssl"])
                     state = advance_pipeline_once(
                         api, state, model_profile_id, event_rate_scheme_id, output_profile_id,
                         vintage, geohaz_engine_type, geohaz_engine_version, hazard_layer_name,
                     )
                     st.session_state["pipeline_state"] = state
+                    # v5: a fragment rerun only refreshes this block. When the pipeline
+                    # finishes, do ONE full-page rerun so Step 6 and the Submit button
+                    # state update immediately instead of staying stale.
+                    if state["stage"] in ("done", "failed") and prev_stage not in ("done", "failed"):
+                        st.rerun()
 
                 label = STAGE_LABELS.get(state["stage"], state["stage"])
                 if state["stage"] == "done":
@@ -2015,8 +2038,19 @@ else:
 
                 if state["stage"] == "done":
                     st.caption(
-                        f"Analysis job **{state['an_job_id']}** completed. Pull stats via this "
-                        f"Analysis ID using your existing RMS Analysis Total AAL tooling."
+                        f"Analysis job **{state['an_job_id']}** completed. Continue to step 6 "
+                        f"below to pull the results."
                     )
 
             render_pipeline_status()
+
+
+# ==========================================================================
+# 6. Results, Marginal Impact & Report Summary  (v5)
+# Implemented in rms_results_ui.py / rms_results.py / rms_workbook.py
+# ==========================================================================
+render_results_step(
+    host=host, li_api_key=api_key, risk_api_key=rms_import_api_key,
+    verify=verify_ssl, account_key=account_key,
+    loc_df=st.session_state.get("loc_df"),
+)
