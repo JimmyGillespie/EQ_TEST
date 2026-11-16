@@ -1,0 +1,891 @@
+"""
+rms_workbook.py - writes the results workbook with the SAME sheets / cell positions the VBA produces.
+
+    Results             RP_ResetForNewRun + RP_PullEpForAnalysis      (GU + GR, AEP/OEP)
+    Meta                16-column schema (+ grouped analysis row from MI_AppendGroupedAnalysisToMeta)
+    RDS Events          RP_PullRdsForAnalysis + RP_FormatRdsEvents
+    RDS Debug           RP_LogDebug
+    Top Locations       RP_PullTopLocationsForAnalysis + RP_FormatTopLocations
+    Top Locations Debug
+    Marginal Impact     MI_WriteLabelScaffold / MI_WriteResultBlock / MI_WriteMarginalBlock
+    Locations / Map     modLocationsHazard
+    Report Summary      modReportSummary (every block, number format, colour and CF rule)
+
+NOT reproduced (they are workbook templates / PivotTables, not VBA output): the per-layer 'EP Gross'
+copy tabs and the 'Exposure Summary' PivotTable. Report Summary reads the same numbers straight from
+the API data instead of from those tabs.
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from io import BytesIO
+
+from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+from rms_results import (ALL_LOC_HEADERS, EVENT_MAP, RP_LIST, TOPLOC_HEADERS, to_num)
+
+# ---------------------------------------------------------------------------
+_NUM_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def xl(v):
+    """What Excel does when a numeric-looking STRING is assigned to a cell."""
+    if isinstance(v, str):
+        s = v.strip()
+        if s and _NUM_RE.match(s):
+            f = float(s)
+            return int(f) if f.is_integer() and "." not in s and "e" not in s.lower() else f
+    return v
+
+
+def vba_rgb(n: int) -> str:
+    """VBA Long colour (BGR) -> 'RRGGBB'."""
+    return f"{n & 255:02X}{(n >> 8) & 255:02X}{(n >> 16) & 255:02X}"
+
+
+GREY = "D9D9D9"
+BLUE = "0066CC"
+ZEBRA = "F2F2F2"
+CLR_BANNER = vba_rgb(8465185)     # navy
+CLR_SECTION = vba_rgb(15987699)   # light grey/blue
+
+TIV_FMT = '#,##0;(#,##0);"-"'
+
+
+def _fill(rgb):
+    return PatternFill(start_color=rgb, end_color=rgb, fill_type="solid")
+
+
+def _autofit(ws, first_col=1, last_col=None, cap=80, skip_cols=(), min_w=8.43):
+    last_col = last_col or ws.max_column
+    merged = set()
+    for rng in ws.merged_cells.ranges:
+        for row in ws.iter_rows(min_row=rng.min_row, max_row=rng.max_row,
+                                min_col=rng.min_col, max_col=rng.max_col):
+            for cell in row:
+                merged.add(cell.coordinate)
+    for c in range(first_col, last_col + 1):
+        if c in skip_cols:
+            continue
+        w = 0
+        for row in ws.iter_rows(min_col=c, max_col=c):
+            cell = row[0]
+            if cell.value is None or cell.coordinate in merged:
+                continue
+            v = cell.value
+            if isinstance(v, float) or isinstance(v, int):
+                n = len(f"{v:,.0f}") if "#,##0" in (cell.number_format or "") else len(str(v))
+            else:
+                n = len(str(v))
+            w = max(w, n)
+        ws.column_dimensions[get_column_letter(c)].width = min(max(w + 2, min_w), cap)
+
+
+def _thin_borders(ws, r1, c1, r2, c2, color="C8C8C8"):
+    side = Side(style="thin", color=color)
+    for row in ws.iter_rows(min_row=r1, max_row=r2, min_col=c1, max_col=c2):
+        for cell in row:
+            cell.border = Border(left=side, right=side, top=side, bottom=side)
+
+
+def _num(v, default=0.0):
+    n = to_num(v)
+    return default if n is None else n
+
+
+# ===========================================================================
+# Results
+# ===========================================================================
+def write_results(wb, entries):
+    ws = wb.create_sheet("Results")
+    base = 5
+    ws.cell(1, 1, "Grouping ID:")
+    ws.cell(2, 1, "Index 1")
+    ws.cell(3, 1, "Index 2")
+    for i, lab in enumerate(["Portfolio Name:", "Portfolio ID", "Analysis Name:", "Layer:", "Analysis ID:",
+                             "Peril:", "Peril Code:", "Subperil:", "Perspective:", "EP Type"]):
+        ws.cell(base + i, 1, lab)
+    for ii, rp in enumerate(RP_LIST):
+        ws.cell(base + 10 + ii, 1, rp)
+    n = len(RP_LIST)
+    ws.cell(base + 10 + n, 1, "Pure Premium:")
+    ws.cell(base + 10 + n + 1, 1, "Std Dev:")
+    ws.cell(base + 10 + n + 2, 1, "CV:")
+    col = 2
+    for e in entries:
+        d, layer = e["data"], e["layer"]
+        for p in ("GU", "GR"):
+            pp, sd, cv = d["statsDict"].get(p, (None, None, None))
+            for ep in ("AEP", "OEP"):
+                arr = d["epDict"].get(f"{p}_{ep}")
+                if arr is None:
+                    continue
+                if e.get("grouping_id") not in (None, ""):
+                    ws.cell(1, col, e["grouping_id"])
+                ws.cell(2, col, f"{p}_{ep}_{d['perilCode']}_{layer}")
+                ws.cell(3, col, f"{p}_{ep}_{d['perilCode']}_{d['analysisId']}_{layer}")
+                vals = [d["portfolioName"], d["exposureID"], d["analysisName"], layer, d["analysisId"],
+                        d["peril"], d["perilCode"], d["subPeril"], p, ep]
+                for i, v in enumerate(vals):
+                    ws.cell(base + i, col, xl(v) if v != "" else None)
+                for ii, v in enumerate(arr):
+                    ws.cell(base + 10 + ii, col, v)
+                ws.cell(base + 10 + n, col, pp)
+                ws.cell(base + 10 + n + 1, col, sd)
+                ws.cell(base + 10 + n + 2, col, cv)
+                col += 1
+    _autofit(ws, 1, max(col - 1, 1))
+    return ws
+
+
+# ===========================================================================
+# Meta / RDS / Top Locations
+# ===========================================================================
+META_HEADERS = ["Analysis ID", "Analysis Name", "Layer", "Peril", "Region", "Engine Version",
+                "Loss Amplification", "Currency Code", "Currency Name", "Currency Vintage",
+                "Model Profile", "Output Profile", "Username", "Exposure Name", "Description", "Analysis URL"]
+
+
+def write_meta(wb, rows):
+    ws = wb.create_sheet("Meta")
+    for c, h in enumerate(META_HEADERS, 1):
+        ws.cell(1, c, h)
+    for r, row in enumerate(rows, 2):
+        for c, v in enumerate(row, 1):
+            ws.cell(r, c, xl(v) if v not in ("", None) else None)
+    _autofit(ws, 1, 4)
+    return ws
+
+
+def write_rds_events(wb, rds_cols):
+    ws = wb.create_sheet("RDS Events")
+    ws.cell(1, 1, "Eventid")
+    ws.cell(1, 2, "EventName")
+    for i, (eid, name) in enumerate(EVENT_MAP.items()):
+        ws.cell(2 + i, 1, xl(eid))
+        ws.cell(2 + i, 2, name)
+    col = 3
+    bold_rows = set()
+    for hdr, vals in rds_cols.items():
+        ws.cell(1, col, hdr)
+        for i, eid in enumerate(EVENT_MAP):
+            if eid in vals and vals[eid] > 0:
+                ws.cell(2 + i, col, vals[eid])
+                bold_rows.add(2 + i)
+        col += 1
+    last_col = max(col - 1, 2)
+    last_row = 1 + len(EVENT_MAP)
+    for r in bold_rows:
+        for c in range(1, last_col + 1):
+            ws.cell(r, c).font = Font(bold=True)
+    for c in range(1, last_col + 1):
+        cell = ws.cell(1, c)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = _fill(BLUE)
+    for r in range(2, last_row + 1):
+        for c in range(3, last_col + 1):
+            ws.cell(r, c).number_format = "#,##0"
+    _thin_borders(ws, 1, 1, last_row, last_col)
+    for r in range(2, last_row + 1):
+        if r % 2 == 0:
+            for c in range(1, last_col + 1):
+                ws.cell(r, c).fill = _fill(ZEBRA)
+    _autofit(ws, 1, last_col)
+    return ws
+
+
+DBG_HEADERS = ["Row", "AnalysisID", "AnalysisName", "Layer", "Perspective", "Status", "URL",
+               "ResponseSnippet", "ExposureID"]
+
+
+def write_debug(wb, name, rows, bold_header=False):
+    ws = wb.create_sheet(name)
+    for c, h in enumerate(DBG_HEADERS, 1):
+        cell = ws.cell(1, c, h)
+        if bold_header:
+            cell.font = Font(bold=True)
+    for r, row in enumerate(rows, 2):
+        for c, v in enumerate(row, 1):
+            ws.cell(r, c, xl(v) if v not in ("", None) else None)
+    return ws
+
+
+def write_top_locations(wb, blocks):
+    ws = wb.create_sheet("Top Locations")
+    for c, h in enumerate(TOPLOC_HEADERS, 1):
+        ws.cell(1, c, h).font = Font(bold=True)
+    r = 2
+    for layer, rows in blocks:
+        if r > 2:
+            r += 1
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=19)
+        t = ws.cell(r, 1, f"Layer: {layer}")
+        t.font = Font(bold=True)
+        t.fill = _fill(GREY)
+        r += 1
+        for row in rows:
+            for c, v in enumerate(row, 1):
+                ws.cell(r, c, xl(v) if v not in ("", None) else None)
+            r += 1
+    last = ws.max_row
+    for c in range(1, 20):
+        cell = ws.cell(1, c)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = _fill(BLUE)
+    for rr in range(2, last + 1):
+        for c in range(16, 20):
+            ws.cell(rr, c).number_format = "#,##0"
+    _autofit(ws, 1, 19)
+    _thin_borders(ws, 1, 1, last, 19)
+    for rr in range(2, last + 1):
+        if rr % 2 == 0:
+            for c in range(1, 20):
+                ws.cell(rr, c).fill = _fill(ZEBRA)
+    return ws
+
+
+# ===========================================================================
+# Locations / Map
+# ===========================================================================
+def write_locations(wb, locs):
+    ws = wb.create_sheet("Locations")
+    for c, h in enumerate(ALL_LOC_HEADERS, 1):
+        ws.cell(1, c, h).font = Font(bold=True)
+    for r, d in enumerate(locs, 2):
+        for c, h in enumerate(ALL_LOC_HEADERS, 1):
+            v = d.get(h)
+            if h != "Postal Code":
+                v = xl(v)
+            ws.cell(r, c, v)
+    last = max(len(locs) + 1, 1)
+    for r in range(2, last + 1):
+        for c in range(5, 9):
+            ws.cell(r, c).number_format = "#,##0"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(ALL_LOC_HEADERS))}{last}"
+    _autofit(ws, 1, len(ALL_LOC_HEADERS), cap=60)
+    return ws
+
+
+def write_map(wb, map_rows):
+    ws = wb.create_sheet("Map")
+    for c, h in enumerate(["Latitude", "Longitude", "Lat,Long", "Location TIV Sum", "LocID Count"], 1):
+        ws.cell(1, c, h).font = Font(bold=True)
+    for r, v in enumerate(map_rows, 2):
+        ws.cell(r, 1, xl(v[0]))
+        ws.cell(r, 2, xl(v[1]))
+        ws.cell(r, 3, v[2])
+        ws.cell(r, 4, v[4]).number_format = "#,##0"
+        ws.cell(r, 5, v[3]).number_format = "0"
+    ws.auto_filter.ref = f"A1:E{max(len(map_rows) + 1, 1)}"
+    _autofit(ws, 1, 5)
+    return ws
+
+
+# ===========================================================================
+# Marginal Impact
+# ===========================================================================
+MI_A1 = ("Marginal Impact - one 'Quote (EQ) | Portfolio (in-force) | Quote + Portfolio (Grouped) | Marginal Impact' "
+         "column-group per layer, left to right. Portfolio (in-force) = Controls!A2 (same book for every layer). "
+         "Quote (EQ) analysisIds = Controls!C2 downwards, paired with the layer name in column D (falls back to "
+         "the 'Results' tab if Controls!C2 is blank). Green columns = the ACTUAL marginal impact (Grouped minus "
+         "Portfolio) of writing that layer's quote.")
+
+
+def _mi_scaffold(ws, base):
+    labels = ["Result Set:", "Analysis ID used:", "Index 1", "Index 2", "Portfolio Name:", "Exposure ID:",
+              "Analysis Name:", "Layer:", "Analysis ID (API):", "Peril:", "Peril Code:", "Subperil:",
+              "Perspective:", "EP Type"]
+    for i, lab in enumerate(labels):
+        ws.cell(2 + i, 1, lab)
+    for ii, rp in enumerate(RP_LIST):
+        ws.cell(base + ii, 1, rp)
+    n = len(RP_LIST)
+    ws.cell(base + n, 1, "Pure Premium:")
+    ws.cell(base + n + 1, 1, "Std Dev:")
+    ws.cell(base + n + 2, 1, "CV:")
+    for r in range(1, base + n + 3):
+        ws.cell(r, 1).font = Font(bold=True)
+
+
+def _mi_header(ws, start_col, end_col, text, green=False):
+    if end_col <= start_col:
+        end_col = start_col
+    if end_col > start_col:
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+    cell = ws.cell(1, start_col, text)
+    cell.font = Font(bold=True, color="006400") if green else Font(bold=True)
+    cell.fill = _fill("E2EFDA" if green else GREY)
+    cell.alignment = Alignment(horizontal="center")
+
+
+def _mi_result_block(ws, d, label, analysis_id, base, col, layer):
+    start = col
+    n = len(RP_LIST)
+    for p in ("GU", "GR", "RL"):
+        for ep in ("AEP", "OEP"):
+            arr = d["epDict"].get(f"{p}_{ep}")
+            if arr is None:
+                continue
+            idx = f"{p}_{ep}_{d['perilCode']}_{layer}"
+            vals = {2: label, 3: analysis_id, 4: idx, 5: idx, 6: d["portfolioName"], 7: d["exposureID"],
+                    8: d["analysisName"], 9: layer, 10: analysis_id, 11: d["peril"], 12: d["perilCode"],
+                    13: d["subPeril"], 14: p, 15: ep}
+            for r, v in vals.items():
+                ws.cell(r, col, xl(v) if v != "" else None)
+            for ii, v in enumerate(arr):
+                ws.cell(base + ii, col, v)
+            st = d["statsDict"].get(p, (None, None, None))
+            for k in range(3):
+                ws.cell(base + n + k, col, st[k])
+            col += 1
+    if col > start:
+        _mi_header(ws, start, col - 1, f"{layer} - {label}")
+    return col
+
+
+def _mi_marginal_block(ws, g, p_, label, base, col, layer):
+    start = col
+    n = len(RP_LIST)
+    for p in ("GU", "GR", "RL"):
+        for ep in ("AEP", "OEP"):
+            k = f"{p}_{ep}"
+            if k not in g["epDict"] or k not in p_["epDict"]:
+                continue
+            idx = f"{p}_{ep}_{g['perilCode']}_{layer}"
+            vals = {2: label, 3: f"{g['analysisId']} - {p_['analysisId']}", 4: idx, 5: idx,
+                    6: g["portfolioName"], 9: layer, 11: g["peril"], 12: g["perilCode"],
+                    13: g["subPeril"], 14: p, 15: ep}
+            for r, v in vals.items():
+                ws.cell(r, col, xl(v) if v != "" else None)
+            ga, pa = g["epDict"][k], p_["epDict"][k]
+            # VBA: Empty array slots are IsNumeric()==True and count as 0
+            for ii in range(n):
+                ws.cell(base + ii, col, _num(ga[ii]) - _num(pa[ii]))
+            gs, ps = g["statsDict"].get(p, (None,) * 3), p_["statsDict"].get(p, (None,) * 3)
+            for j in range(3):
+                if gs[j] is not None and ps[j] is not None:      # blank/non-numeric -> not written
+                    ws.cell(base + n + j, col, gs[j] - ps[j])
+            col += 1
+    if col > start:
+        _mi_header(ws, start, col - 1, f"{layer} - {label}", green=True)
+    return col
+
+
+def write_marginal_impact(wb, mi):
+    ws = wb.create_sheet("Marginal Impact")
+    base = 16
+    ws["A1"] = MI_A1
+    _mi_scaffold(ws, base)
+    layer = mi["layer"]
+    col = 2
+    col = _mi_result_block(ws, mi["quote"], "Quote (EQ)", mi["quote_id"], base, col, layer)
+    col = _mi_result_block(ws, mi["portfolio"], "Portfolio (in-force)", mi["portfolio_id"], base, col, layer)
+    col = _mi_result_block(ws, mi["grouped"], "Quote + Portfolio (Grouped)", mi["group_id"], base, col, layer)
+    col = _mi_marginal_block(ws, mi["grouped"], mi["portfolio"], "Marginal Impact (Grouped minus Portfolio)",
+                             base, col, layer)
+    _autofit(ws, 2, max(col - 1, 2), skip_cols=())
+    ws.column_dimensions["A"].width = 22
+    return ws
+
+
+# ===========================================================================
+# Report Summary (modReportSummary)
+# ===========================================================================
+BANNER_LAST_COL = 20
+COL1, COL2, COL3, COL4, COL5 = 1, 6, 10, 14, 18
+TOP_N = 5
+TARGET_RP = 250
+RDS_EVENTS = ("Los Angeles EQ", "San Francisco EQ", "New Madrid RDS EQ")
+
+HAZ_RED = ["Very High", "High to Very High"]
+HAZ_AMBER = ["High", "Moderate to High", "Moderate"]
+HAZ_GREEN = ["Low to Moderate", "Low", "Very Low to Low", "Very Low"]
+SOIL_RED = ["Soft Soil"]
+SOIL_AMBER = ["Stiff Soil to Soft Soil"]
+SOIL_GREEN = ["Stiff Soil", "Soft Rock to Stiff Soil", "Soft Rock", "Rock to Soft Rock", "Rock"]
+UNKNOWN_LEVELS = ["Unknown", "Other"]
+HAZ_LEVEL_ORDER = ["Very High", "High to Very High", "High", "Moderate to High", "Moderate",
+                   "Low to Moderate", "Low", "Very Low to Low", "Very Low", "Unknown"]
+SOIL_ORDER = ["Soft Soil", "Stiff Soil to Soft Soil", "Stiff Soil", "Soft Rock to Stiff Soil",
+              "Soft Rock", "Rock to Soft Rock", "Rock", "Unknown"]
+STORIES_ORDER = [">10", "6-10", "3-5", "1-2", "Unknown"]
+YEAR_ORDER = ["2020-2030", "2010-2020", "2000-2010", "1990-2000", "Pre-1990", "Unknown"]
+RESOLUTION_ORDER = ["Coordinate", "Parcel", "Building", "Street", "Postal Code", "City", "Unknown"]
+
+FLOOD_KEY_ITEMS = [
+    ("floodZone", "FEMA flood zone at the location (from the FEMA flood maps). Zones starting A or V (A, AE, AO, VE) = high-risk Special Flood Hazard Area; X = moderate / minimal risk. Unmapped = FEMA has no zone for the point."),
+    ("floodDepthUndef100yr", "Flood depth band at the location in a 1-in-100-year flood, UNDEFENDED (ignores flood defences such as levees). RMS band code - higher number = deeper water."),
+    ("floodDepthDef100yr", "Same 1-in-100-year flood depth band, but DEFENDED (allows for flood defences) - usually equal to or lower than the undefended band."),
+    ("floodDepthUndef500yr", "Flood depth band in a 1-in-500-year flood, UNDEFENDED. Higher number = deeper water."),
+    ("floodDepthDef500yr", "Flood depth band in a 1-in-500-year flood, DEFENDED (allows for flood defences)."),
+    ("floodScoreOverall", "RMS flood RiskScore, overall: one number combining how severe flooding is at the site and how vulnerable the building is (construction, occupancy, year built, stories). Higher = higher risk. Use it to rank locations - it is not a loss amount."),
+    ("floodScore100yr", "The same RiskScore, calculated at the 1-in-100-year flood level."),
+    ("floodScore250yr", "The same RiskScore, calculated at the 1-in-250-year flood level."),
+    ("floodScore500yr", "The same RiskScore, calculated at the 1-in-500-year flood level."),
+]
+
+
+def _cs(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v).strip()
+
+
+def _category_rows(locs, header):
+    """RS_GetCategoryRowsFromLocations -> [(label, count, tiv)] in first-seen order."""
+    if not locs or header not in locs[0] or "Location TIV" not in locs[0]:
+        return []
+    acc = {}
+    for d in locs:
+        lbl = _cs(d.get(header))
+        if lbl == "":
+            lbl = "Unknown"
+        tiv = _num(d.get("Location TIV"))
+        k = lbl.lower()
+        if k in acc:
+            acc[k][1] += 1
+            acc[k][2] += tiv
+        else:
+            acc[k] = [lbl, 1, tiv]
+    return [tuple(v) for v in acc.values()]
+
+
+def _stories_rows(locs):
+    """RS_GetStoriesBandRows"""
+    if not locs or "# of Stories" not in locs[0]:
+        return []
+    acc = {}
+    for d in locs:
+        n = to_num(d.get("# of Stories"))
+        if n is None or n <= 0:
+            band = "Unknown"
+        elif n <= 2:
+            band = "1-2"
+        elif n <= 5:
+            band = "3-5"
+        elif n <= 10:
+            band = "6-10"
+        else:
+            band = ">10"
+        tiv = _num(d.get("Location TIV"))
+        if band in acc:
+            acc[band][1] += 1
+            acc[band][2] += tiv
+        else:
+            acc[band] = [band, 1, tiv]
+    return [tuple(v) for v in acc.values()]
+
+
+def _find_catch_all(order):
+    for i, o in enumerate(order):
+        if o.strip().lower() in ("unknown", "other"):
+            return i
+    return -1
+
+
+def _order_with_extras(order, rows):
+    known = {o.strip().lower() for o in order}
+    extras = []
+    for lbl, _c, _t in rows:
+        lbl = lbl.strip()
+        if lbl and lbl.lower() not in known:
+            known.add(lbl.lower())
+            extras.append(lbl)
+    if not extras:
+        return list(order)
+    cidx = _find_catch_all(order)
+    out = []
+    for i, o in enumerate(order):
+        if i == cidx:
+            out.extend(extras)
+        out.append(o)
+    if cidx == -1:
+        out.extend(extras)
+    return out
+
+
+def _in_list(lbl, lst):
+    return lbl.strip().lower() in {x.strip().lower() for x in lst}
+
+
+def _hazard_tier(lbl, red, amber, green):
+    if _in_list(lbl, UNKNOWN_LEVELS):
+        return "PINK"
+    if _in_list(lbl, red):
+        return "RED"
+    if _in_list(lbl, amber):
+        return "AMBER"
+    if _in_list(lbl, green):
+        return "GREEN"          # HAZ_SHOW_GREEN = True
+    return "PINK"               # label in no list at all -> shown pink so it gets noticed
+
+
+class _RS:
+    def __init__(self, ws, locs):
+        self.ws, self.locs = ws, locs
+
+    # -- drawing helpers ------------------------------------------------
+    def banner(self, r, text):
+        for c in range(1, BANNER_LAST_COL + 1):
+            cell = self.ws.cell(r, c)
+            cell.fill = _fill(CLR_BANNER)
+            cell.font = Font(bold=True, color="FFFFFF", size=12)
+        self.ws.cell(r, 1, text)
+
+    def box(self, r1, c1, r2, c2):
+        if r2 < r1 or c2 < c1:
+            return
+        hair = Side(style="hair", color="BFBFBF")
+        thin = Side(style="thin", color="595959")
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                self.ws.cell(r, c).border = Border(
+                    left=thin if c == c1 else hair, right=thin if c == c2 else hair,
+                    top=thin if r == r1 else hair, bottom=thin if r == r2 else hair)
+
+    def title3(self, r, c, title):
+        ws = self.ws
+        ws.cell(r, c, title)
+        ws.cell(r, c + 1, "Loc Count")
+        ws.cell(r, c + 2, "TIV")
+        for k in range(3):
+            ws.cell(r, c + k).font = Font(bold=True)
+            ws.cell(r, c + k).fill = _fill(CLR_SECTION)
+
+    def row3(self, r, c, label, cnt, tiv, bold=False):
+        ws = self.ws
+        ws.cell(r, c).number_format = "@"
+        ws.cell(r, c, label)
+        ws.cell(r, c + 1, cnt)
+        ws.cell(r, c + 2, tiv).number_format = TIV_FMT
+        if bold:
+            for k in range(3):
+                ws.cell(r, c + k).font = Font(bold=True)
+
+    # -- blocks ---------------------------------------------------------
+    def breakdown(self, r0, c, title, rows, order, add_extras=False):
+        """RS_WriteBreakdownBlock(Loc) / RS_WriteStoriesBlock. Returns next free row."""
+        self.title3(r0, c, title)
+        r = r0 + 1
+        d1 = {}
+        for lbl, cnt, tiv in rows:
+            d1.setdefault(lbl.strip().lower(), (cnt, tiv))
+        use = _order_with_extras(order, rows) if add_extras else list(order)
+        if not use:
+            use = list(d1.keys())
+        matched = {u.lower() for u in use}
+        left_c = sum(v[0] for k, v in d1.items() if k not in matched)
+        left_t = sum(v[1] for k, v in d1.items() if k not in matched)
+        cidx = _find_catch_all(use)
+        tc = tt = 0.0
+        for i, lab in enumerate(use):
+            cnt, tiv = d1.get(lab.lower(), (0, 0.0))
+            if i == cidx:
+                cnt, tiv = cnt + left_c, tiv + left_t
+            self.row3(r, c, lab, cnt, tiv)
+            tc, tt = tc + cnt, tt + tiv
+            r += 1
+        if cidx == -1 and (left_c != 0 or left_t != 0):
+            self.row3(r, c, "Other", left_c, left_t)
+            tc, tt = tc + left_c, tt + left_t
+            r += 1
+        self.row3(r, c, "Grand Total", tc, tt, bold=True)
+        self.box(r0, c, r, c + 2)
+        return r + 1
+
+    def top5(self, r0, c, title, rows):
+        """RS_WriteTop5Block(Loc)"""
+        self.title3(r0, c, title)
+        r = r0 + 1
+        top = sorted(rows, key=lambda x: -_num(x[2]))[:TOP_N]       # stable, descending by TIV
+        tc = tt = 0.0
+        for i in range(TOP_N):
+            if i < len(top):
+                self.row3(r, c, top[i][0], top[i][1], top[i][2])
+                tc, tt = tc + _num(top[i][1]), tt + _num(top[i][2])
+            else:
+                self.ws.cell(r, c + 2).number_format = TIV_FMT
+            r += 1
+        self.row3(r, c, "Total (All Categories)", tc, tt, bold=True)
+        self.box(r0, c, r, c + 2)
+        return r + 1
+
+    def hazard_block(self, r0, c, title, value_hdr, header):
+        """RS_WriteHazardBlock (flood)"""
+        ws = self.ws
+        ws.cell(r0, c, title).font = Font(bold=True)
+        r = r0 + 1
+        ws.cell(r, c, value_hdr)
+        ws.cell(r, c + 1, "Loc Count")
+        ws.cell(r, c + 2, "TIV")
+        for k in range(3):
+            ws.cell(r, c + k).font = Font(bold=True)
+            ws.cell(r, c + k).fill = _fill(CLR_SECTION)
+        rows = _category_rows(self.locs, header)
+        tc = tt = 0.0
+        if not rows:
+            r += 1
+            ws.cell(r, c, f"No data ({header} not found on Locations)")
+        else:
+            def rank(s):
+                if to_num(s) is not None:
+                    return 0
+                return 2 if s.strip().lower() in ("unmapped", "unknown", "n/a", "error", "not looked up") else 1
+
+            def less_key(x):
+                s = x[0]
+                rk = rank(s)
+                return (rk, to_num(s) if rk == 0 else 0, s.lower() if rk != 0 else "")
+
+            for lbl, cnt, tiv in sorted(rows, key=less_key):
+                r += 1
+                cell = ws.cell(r, c)
+                cell.number_format = "@"
+                cell.value = lbl
+                cell.alignment = Alignment(horizontal="left")
+                ws.cell(r, c + 1, cnt)
+                ws.cell(r, c + 2, tiv).number_format = TIV_FMT
+                tc, tt = tc + cnt, tt + tiv
+        r += 1
+        ws.cell(r, c, "Grand Total")
+        ws.cell(r, c + 1, tc)
+        ws.cell(r, c + 2, tt).number_format = TIV_FMT
+        for k in range(3):
+            ws.cell(r, c + k).font = Font(bold=True)
+        self.box(r0 + 1, c, r, c + 2)
+        return r + 1
+
+    def apply_hazard_cf(self, first, last, c, red, amber, green):
+        """RS_ApplyHazardCF: one rule per data row, only lit while Loc Count > 0."""
+        if last < first:
+            return
+        ws = self.ws
+        for r in range(first, last + 1):
+            tier = _hazard_tier(_cs(ws.cell(r, c).value), red, amber, green)
+            cnt = f"${get_column_letter(c + 1)}${r}"
+            rng = f"{get_column_letter(c)}{r}:{get_column_letter(c + 2)}{r}"
+            if tier == "RED":
+                font, fill = Font(bold=True, color="9C0006"), _fill("FFC7CE")
+            elif tier == "AMBER":
+                font, fill = Font(color="9C5700"), _fill("FFD966")
+            elif tier == "GREEN":
+                font, fill = Font(color="006100"), _fill("C6EFCE")
+            else:
+                font, fill = Font(bold=True, color="99004C"), _fill("FF99CC")
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[f"{cnt}>0"], font=font, fill=fill))
+
+    def flood_key(self, r):
+        ws = self.ws
+        ws.cell(r, 1, "What the flood hazard fields mean").font = Font(bold=True)
+        r += 1
+        start = r
+        ws.cell(r, 1, "Field")
+        ws.cell(r, 2, "Short explanation")
+        for c in range(1, BANNER_LAST_COL + 1):
+            ws.cell(r, c).font = Font(bold=True)
+            ws.cell(r, c).fill = _fill(CLR_SECTION)
+        for name, text in FLOOD_KEY_ITEMS:
+            r += 1
+            ws.cell(r, 1, name).font = Font(bold=True)
+            ws.cell(r, 2, text)
+            ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=BANNER_LAST_COL)
+            ws.cell(r, 2).alignment = Alignment(horizontal="left")
+        ws.merge_cells(start_row=start, start_column=2, end_row=start, end_column=BANNER_LAST_COL)
+        ws.cell(start, 2).alignment = Alignment(horizontal="left")
+        self.box(start, 1, r, BANNER_LAST_COL)
+        r += 1
+        c = ws.cell(r, 1, "Source: Moody's RMS Location Intelligence (FEMA flood zone, US Flood Depth, "
+                          "US Flood Risk Score), looked up for each location on the Locations sheet.")
+        c.font = Font(italic=True, size=9)
+        return r + 2
+
+
+def layer_summary_rows(bundle) -> list:
+    """What the layer tab + RDS Events feed into 'Layer Statistics'."""
+    rows = []
+    mi = bundle.get("mi")
+    k250 = RP_LIST.index(TARGET_RP)
+    for e in bundle["analyses"]:
+        layer = e["layer"]
+        pp = e["data"]["statsDict"].get("GR", (None,))[0]
+        row = {"layer": layer, "pure_prem": _num(pp), "portfolio": 0.0, "quote": 0.0, "grouped": 0.0,
+               "marginal": 0.0, "impact": 0.0}
+        if mi and mi["layer"] == layer:
+            def at(d):
+                a = d["epDict"].get("GR_OEP")
+                return _num(a[k250]) if a else 0.0
+            row["portfolio"], row["quote"], row["grouped"] = at(mi["portfolio"]), at(mi["quote"]), at(mi["grouped"])
+            row["marginal"] = row["grouped"] - row["portfolio"]
+            # ASSUMPTION: 'Impact %' on the template = Marginal / Portfolio (0 when Portfolio is 0)
+            row["impact"] = row["marginal"] / row["portfolio"] if row["portfolio"] else 0.0
+        vals = bundle["rds_cols"].get(f"{layer}_GR", {})
+        by_name = {EVENT_MAP[k]: v for k, v in vals.items() if k in EVENT_MAP}
+        row["rds"] = [_num(by_name.get(n)) for n in RDS_EVENTS]
+        rows.append(row)
+    return rows
+
+
+def write_report_summary(wb, bundle, now=None):
+    now = now or datetime.now()
+    ws = wb.create_sheet("Report Summary")
+    locs = bundle.get("locations") or []
+    layer_rows = layer_summary_rows(bundle)
+    rs = _RS(ws, locs)
+
+    ws["A1"] = "AMTRUST GROUP"
+    ws["A1"].font = Font(size=20, bold=True)
+    ws["A2"] = "Report Summary"
+    ws["A2"].font = Font(size=16, italic=True)
+    ws["F2"] = "Report generated: " + now.strftime("%d/%m/%Y %H:%M")
+    ws["F2"].font = Font(italic=True)
+
+    # ---- Layer Statistics --------------------------------------------------
+    r = 4
+    rs.banner(r, "Layer Statistics (EQ, Gross Perspective)")
+    r += 1
+    hdr = r
+    cRP, cLB, cP, cQ, cG, cM, cI = 6, 7, 8, 9, 10, 11, 12
+    cRL, cE1, cE2, cE3 = 14, 15, 16, 17
+    ws.cell(r, 1, "Layer")
+    ws.cell(r, 2, "Pure Premium")
+    ws.cell(r, cRP, "Return Period ( OEP )")
+    ws.cell(r, cP, "Portfolio")
+    ws.cell(r, cQ, "Quote")
+    ws.cell(r, cG, "Quote + Portfolio")
+    ws.cell(r, cM, "Marginal Impact")
+    ws.cell(r, cI, "Impact %")
+    ws.cell(r, cRL, "RDS")
+    for k, ev in enumerate(RDS_EVENTS):
+        ws.cell(r, cE1 + k, ev)
+    for a, b in ((1, 2), (cRP, cI), (cRL, cE3)):
+        for c in range(a, b + 1):
+            ws.cell(r, c).font = Font(bold=True, color="FFFFFF")
+            ws.cell(r, c).fill = _fill(CLR_BANNER)
+    first = r + 1
+    r = first
+    total_pp = 0.0
+    if not layer_rows:
+        ws.cell(r, 1, "No layer tabs found - check Controls!D or 'Loss Overview' marker.")
+    else:
+        for i, lr in enumerate(layer_rows):
+            ws.cell(r, 1, lr["layer"])
+            ws.cell(r, 2, lr["pure_prem"])
+            if r == first:
+                ws.cell(r, cRP, TARGET_RP)
+            ws.cell(r, cLB, lr["layer"])
+            ws.cell(r, cP, lr["portfolio"])
+            ws.cell(r, cQ, lr["quote"])
+            ws.cell(r, cG, lr["grouped"])
+            ws.cell(r, cM, lr["marginal"])
+            ws.cell(r, cI, lr["impact"])
+            ws.cell(r, cRL, lr["layer"])
+            for k in range(3):
+                ws.cell(r, cE1 + k, lr["rds"][k])
+            total_pp += lr["pure_prem"]
+            r += 1
+        last = r - 1
+        total_row = r
+        ws.cell(r, 1, "Total").font = Font(bold=True)
+        ws.cell(r, 2, total_pp).font = Font(bold=True)
+        r += 1
+        ws.cell(r, 1, "Note: sourced directly from each layer tab's own Statistics block (GR perspective, EQ peril); "
+                      "RDS losses sourced from 'RDS Events'.").font = Font(italic=True)
+        for rr in range(first, total_row + 1):
+            ws.cell(rr, 2).number_format = "#,##0"
+        for rr in range(first, last + 1):
+            for c in (cP, cQ, cG, cM, cE1, cE2, cE3):
+                ws.cell(rr, c).number_format = "#,##0"
+            ws.cell(rr, cI).number_format = "0.00%"
+        rs.box(hdr, 1, total_row, 2)
+        rs.box(hdr, cRP, last, cI)
+        rs.box(hdr, cRL, last, cE3)
+    r = r + 1          # RS_WriteLayerStatistics returns r+1, caller adds 1 more
+    r = r + 1
+
+    # ---- Exposure Summary --------------------------------------------------
+    rs.banner(r, "Exposure Summary")
+    r += 2
+    total_tiv = sum(_num(d.get("Location TIV")) for d in locs)
+    ws.cell(r, 1, "Total TIV (USD)").font = Font(bold=True)
+    ws.cell(r, 2, total_tiv).number_format = "#,##0"
+    ws.cell(r + 1, 1, "Locations Count").font = Font(bold=True)
+    ws.cell(r + 1, 2, len(locs)).number_format = "#,##0"
+    ws.cell(r + 2, 1, "Layers Modelled").font = Font(bold=True)
+    ws.cell(r + 2, 2, len(layer_rows))
+    ws.cell(r + 3, 1, "Peril Modelled").font = Font(bold=True)
+    ws.cell(r + 3, 2, "EQ")
+    metrics_next = r + 4
+    rs.box(r, 1, r + 3, 2)
+    res_next = rs.breakdown(r, COL2, "Resolution", _category_rows(locs, "Geocoding Resolution"), RESOLUTION_ORDER)
+    cty_next = rs.top5(r, COL3, "Top 5 County by TIV", _category_rows(locs, "Admin2"))
+    cst_next = rs.top5(r, COL4, "Top 5 CRESTA by TIV", _category_rows(locs, "CRESTA"))
+    r = max(metrics_next, res_next, cty_next, cst_next) + 3
+
+    occ_next = rs.top5(r, COL1, "Top 5 Occupancy by TIV", _category_rows(locs, "Occupancy Name"))
+    con_next = rs.top5(r, COL2, "Top 5 Construction by TIV", _category_rows(locs, "Construction Name"))
+    sto_next = rs.breakdown(r, COL3, "Stories", _stories_rows(locs), STORIES_ORDER)
+    yr_next = rs.breakdown(r, COL4, "Year Built", _category_rows(locs, "Year Built Band"), YEAR_ORDER)
+    r = max(occ_next, con_next, sto_next, yr_next)
+
+    rs.banner(r, "Hazard Summary")
+    r += 2
+    liq = rs.breakdown(r, COL1, "Liquefaction", _category_rows(locs, "liquefactionDescription"),
+                       HAZ_LEVEL_ORDER, add_extras=True)
+    rs.apply_hazard_cf(r + 1, liq - 2, COL1, HAZ_RED, HAZ_AMBER, HAZ_GREEN)
+    lan = rs.breakdown(r, COL2, "Landslide", _category_rows(locs, "landslideDescription"),
+                       HAZ_LEVEL_ORDER, add_extras=True)
+    rs.apply_hazard_cf(r + 1, lan - 2, COL2, HAZ_RED, HAZ_AMBER, HAZ_GREEN)
+    soi = rs.breakdown(r, COL3, "Soil Description", _category_rows(locs, "soilDescription"),
+                       SOIL_ORDER, add_extras=True)
+    rs.apply_hazard_cf(r + 1, soi - 2, COL3, SOIL_RED, SOIL_AMBER, SOIL_GREEN)
+    r = max(liq, lan, soi) + 1
+
+    rs.banner(r, "Hazard Summary (Flood)")
+    r += 2
+    h = [rs.hazard_block(r, COL1, "FEMA Flood Zone", "Zone", "floodZone"),
+         rs.hazard_block(r, COL2, "Flood Score - Overall", "Score", "floodScoreOverall"),
+         rs.hazard_block(r, COL3, "Flood Score - 1 in 100", "Score", "floodScore100yr"),
+         rs.hazard_block(r, COL4, "Flood Score - 1 in 250", "Score", "floodScore250yr"),
+         rs.hazard_block(r, COL5, "Flood Score - 1 in 500", "Score", "floodScore500yr")]
+    r = max(h) + 1
+    h = [rs.hazard_block(r, COL1, "Depth Band - 1 in 100, Undefended", "Band", "floodDepthUndef100yr"),
+         rs.hazard_block(r, COL2, "Depth Band - 1 in 100, Defended", "Band", "floodDepthDef100yr"),
+         rs.hazard_block(r, COL3, "Depth Band - 1 in 500, Undefended", "Band", "floodDepthUndef500yr"),
+         rs.hazard_block(r, COL4, "Depth Band - 1 in 500, Defended", "Band", "floodDepthDef500yr")]
+    r = max(h) + 1
+    rs.flood_key(r)
+
+    # RS_FormatReportSheet
+    _autofit(ws, 2, 21, skip_cols=(), cap=40)
+    ws.column_dimensions["A"].width = 26
+    ws.sheet_properties.tabColor = BLUE
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+# ===========================================================================
+def build_workbook(bundle: dict, now: datetime | None = None) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+    write_report_summary(wb, bundle, now)
+    write_results(wb, bundle["analyses"])
+    if bundle.get("mi"):
+        write_marginal_impact(wb, bundle["mi"])
+    write_meta(wb, bundle["meta_rows"])
+    write_rds_events(wb, bundle["rds_cols"])
+    write_debug(wb, "RDS Debug", bundle["rds_dbg"])
+    if bundle["toploc_blocks"]:
+        write_top_locations(wb, bundle["toploc_blocks"])
+        write_debug(wb, "Top Locations Debug", bundle["toploc_dbg"], bold_header=True)
+    if bundle.get("locations"):
+        write_locations(wb, bundle["locations"])
+        write_map(wb, bundle["map_rows"])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
