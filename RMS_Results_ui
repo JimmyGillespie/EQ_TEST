@@ -1,0 +1,209 @@
+"""
+rms_results_ui.py - Streamlit "Step 6" for the RMS LOC/ACC File Builder.
+
+Call once at the very bottom of the main app:
+
+    from rms_results_ui import render_results_step
+    render_results_step(
+        host=host, li_api_key=api_key, risk_api_key=rms_import_api_key, verify=verify_ssl,
+        account_key=account_key, loc_df=st.session_state.get("loc_df"),
+    )
+
+It reads st.session_state["rms_import_job"] (step 4) and st.session_state["pipeline_state"] (step 5).
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
+from rms_results import (Creds, Http, RP_LIST, advance_grouping, pull_quote_stage, _norm_locnum)
+from rms_workbook import build_workbook, layer_summary_rows
+
+DEFAULT_GROUPING_RESOURCE_GROUP_ID = "ff59ac00-c02f-4bb8-b37a-f4a9034c8ff5"   # from modMarginalImpact
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _portfolio_name(account_key: str) -> str:
+    """Same rule the app used when it created the portfolio (sanitize_name(...)[:20])."""
+    return "".join(ch for ch in account_key.strip() if ch.isalnum() or ch in "-_. ")[:20]
+
+
+def _loc_fallback(loc_df, account_key: str) -> dict:
+    out = {}
+    if isinstance(loc_df, pd.DataFrame) and not loc_df.empty and {"LOCNUM", "STATECODE"} <= set(loc_df.columns):
+        for _, r in loc_df.iterrows():
+            code = str(r.get("STATECODE") or "").strip().upper()
+            if code:
+                out[f"{account_key.strip().upper()}|{_norm_locnum(r['LOCNUM'])}"] = code
+    return out
+
+
+def _ep_preview(state) -> pd.DataFrame | None:
+    mi = state["bundle"].get("mi")
+    k = RP_LIST.index(250)
+    if not mi:
+        return None
+    rows = []
+    for i, rp in enumerate(RP_LIST):
+        def at(d, key="GR_OEP"):
+            a = d["epDict"].get(key)
+            return a[i] if a and a[i] is not None else 0.0
+        p, q, g = at(mi["portfolio"]), at(mi["quote"]), at(mi["grouped"])
+        rows.append({"Return Period": rp, "Portfolio": p, "Quote": q, "Quote + Portfolio": g,
+                     "Marginal Impact": g - p, "Impact %": (g - p) / p if p else 0.0})
+    return pd.DataFrame(rows)
+
+
+def render_results_step(*, host, li_api_key, risk_api_key, verify, account_key, loc_df):
+    st.divider()
+    st.subheader("6. Results, Marginal Impact & Report Summary")
+    st.caption(
+        "Pulls EP + stats, RDS events, Top Locations, Locations + hazards (EQ / MMI / flood / FEMA / flood score / "
+        "SubCresta), runs the Marginal Impact grouping job, and builds one Excel workbook laid out exactly like "
+        "the VBA outputs. Ported from modResultsPull, modMarginalImpact, modLocationsHazard and modReportSummary."
+    )
+    job = st.session_state.get("rms_import_job")
+    if not job:
+        st.info("Complete step 4 (Create EDM & Import) first.")
+        return
+    pstate = st.session_state.get("pipeline_state") or {}
+    if pstate.get("stage") != "done":
+        st.info("The analysis (step 5) has not finished yet. You can still pull results if you already know the "
+                "analysis id - type it into the manual override below.")
+
+    with st.expander("Credentials & settings for this step", expanded=False):
+        st.caption("Leave a key blank to reuse the one from the sidebar (the VBA uses the same value for riskdata "
+                   "and hazard). Only the Grouping key is genuinely separate.")
+        c1, c2 = st.columns(2)
+        with c1:
+            riskdata_key = st.text_input("Risk Data key (platform/riskdata/v1 - EP, stats, locations)",
+                                         type="password", key="res_riskdata_key")
+            grouping_key = st.text_input("Grouping API key (platform/grouping/v1)", type="password",
+                                         key="res_grouping_key")
+            rg_id = st.text_input("Grouping resource-group-id", value=DEFAULT_GROUPING_RESOURCE_GROUP_ID,
+                                  key="res_rg_id")
+        with c2:
+            riskmodeler_key = st.text_input("Risk Modeler key (riskmodeler/v2 - RDS / ELT)", type="password",
+                                            key="res_riskmodeler_key")
+            inforce_app = st.text_input("In-force Portfolio appAnalysisId (Controls!A2)", value="65418",
+                                        key="res_inforce_app")
+            inforce_long = st.text_input("…or its long analysisId (Controls!B2) - optional override",
+                                         value="", key="res_inforce_long")
+        manual_quote = st.text_input("Quote (EQ) analysis id - manual override (leave blank to auto-resolve)",
+                                     value="", key="res_manual_quote")
+        o1, o2, o3, o4 = st.columns(4)
+        run_mi = o1.checkbox("Marginal Impact", value=True, key="res_run_mi")
+        run_loc = o2.checkbox("Locations + Map", value=True, key="res_run_loc")
+        run_haz = o3.checkbox("Hazard lookups", value=True, key="res_run_haz",
+                              help="6 Location Intelligence calls per location.")
+        run_top = o4.checkbox("Top Locations", value=True, key="res_run_top")
+
+    state = st.session_state.get("res_state")
+    running = bool(state and state.get("stage") == "grouping")
+
+    if st.button("▶ Pull results & run Marginal Impact", type="primary", disabled=running, key="res_go"):
+        rd_key = (riskdata_key or "").strip() or li_api_key
+        rm_key = (riskmodeler_key or "").strip() or risk_api_key
+        if run_mi and not (grouping_key or "").strip():
+            st.warning("Enter the Grouping API key (or untick Marginal Impact).")
+        elif not rd_key or not rm_key:
+            st.warning("Enter the API keys (sidebar or the expander above).")
+        else:
+            creds = Creds(host=host, riskdata_key=rd_key, riskmodeler_key=rm_key, grouping_key=grouping_key,
+                          hazard_key=li_api_key or rd_key, grouping_resource_group_id=rg_id, verify=verify)
+            ctx = {
+                "edm_name": job["edm_name"], "exposure_id": job["exposure_id"], "account_key": account_key.strip(),
+                "portfolio_name": _portfolio_name(account_key),
+                "workflow_text": pstate.get("an_raw", ""), "manual_quote_id": manual_quote,
+                "inforce_app_id": inforce_app, "inforce_long_id": inforce_long,
+                "run_mi": run_mi, "run_locations": run_loc, "run_hazard": run_haz, "run_toploc": run_top,
+                "loc_fallback": _loc_fallback(loc_df, account_key),
+            }
+            box = st.status("Pulling results...", expanded=True)
+            pull_log = []
+
+            def _log(msg):
+                pull_log.append(msg)
+                box.write(msg)
+            try:
+                new_state = pull_quote_stage(Http(verify), creds, ctx, log=_log)
+                new_state["log"] = pull_log
+                new_state["creds"] = creds
+                new_state["verify"] = verify
+                new_state["account_key"] = account_key.strip()
+                if new_state["stage"] == "done":
+                    new_state["xlsx"] = build_workbook(new_state["bundle"])
+                    box.update(label="✅ Results ready", state="complete")
+                else:
+                    box.update(label="⏳ Grouping job running - polling automatically...", state="running")
+                st.session_state["res_state"] = new_state
+                state = new_state
+            except Exception as exc:                                    # noqa: BLE001
+                box.update(label=f"❌ {exc}", state="error")
+                st.session_state.pop("res_state", None)
+                state = None
+            if state and state["stage"] == "grouping":
+                st.rerun()
+
+    state = st.session_state.get("res_state")
+    if not state:
+        return
+
+    if state["stage"] == "grouping":
+        if st.button("⏹ Stop watching this grouping job", key="res_stop"):
+            st.session_state.pop("res_state", None)
+            st.rerun()
+        @st.fragment(run_every="10s")
+        def _poll():
+            s = st.session_state["res_state"]
+            if s["stage"] == "grouping":
+                s = advance_grouping(Http(s["verify"]), s["creds"], s, log=s["log"].append)
+                if s["stage"] == "done":
+                    s["xlsx"] = build_workbook(s["bundle"])
+                st.session_state["res_state"] = s
+            if s["stage"] != "grouping":
+                st.rerun(scope="app")
+            g = s["group"]
+            st.info(f"⏳ Grouping job **{g['status']}** - poll {g['polls']} (checked every 10 s). "
+                    f"Quote {g['quote_id']} + in-force {g['portfolio_id']}.")
+        _poll()
+        return
+
+    if state["stage"] == "failed":
+        st.error(state.get("error", "Failed."))
+        return
+
+    # ---- done ---------------------------------------------------------------
+    bundle = state["bundle"]
+    st.success(f"✅ Results ready for layer **{state['layer']}** (Quote analysisId {state['quote_id']}"
+               + (f", Group analysisId {state['group']['group_id']}" if state.get("group") else "") + ")")
+    lr = pd.DataFrame(layer_summary_rows(bundle))
+    if not lr.empty:
+        lr = lr.assign(**{"RDS: Los Angeles EQ": lr["rds"].str[0], "RDS: San Francisco EQ": lr["rds"].str[1],
+                          "RDS: New Madrid RDS EQ": lr["rds"].str[2]}).drop(columns=["rds"])
+        st.markdown("**Layer Statistics (250-yr OEP, GR)**")
+        st.dataframe(lr, hide_index=True, width="stretch")
+    ep = _ep_preview(state)
+    if ep is not None:
+        st.markdown("**Marginal Impact - GR OEP**")
+        st.dataframe(ep, hide_index=True, width="stretch")
+    elif run_mi_was_off(state):
+        st.caption("Marginal Impact was switched off for this run.")
+    for layer, rows in bundle["toploc_blocks"]:
+        if rows:
+            st.markdown(f"**Top Locations - {layer}**")
+            from rms_results import TOPLOC_HEADERS
+            st.dataframe(pd.DataFrame(rows, columns=TOPLOC_HEADERS), hide_index=True, width="stretch")
+    with st.expander("Detailed log"):
+        for line in state.get("log", []):
+            st.write(line)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button("⬇️ Download results workbook (.xlsx)", data=state["xlsx"],
+                       file_name=f"{state.get('account_key') or 'export'}_RESULTS_{stamp}.xlsx",
+                       mime=XLSX_MIME, width="stretch")
+
+
+def run_mi_was_off(state) -> bool:
+    return state.get("group") is None
