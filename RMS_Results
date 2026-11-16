@@ -1,0 +1,1348 @@
+"""
+rms_results.py  -  RMS results pipeline for the Streamlit LOC/ACC app
+======================================================================
+Pure-Python port (NO Streamlit dependency) of the confirmed-working VBA:
+
+    modResultsPull       EP / stats / RDS (ELT) / Top Locations / Meta / Results layout
+    modMarginalImpact    Grouping API  ->  Quote | Portfolio | Grouped | Marginal Impact
+    modLocationsHazard   Locations pull + EQ / MMI / flood / FEMA / flood-score / SubCresta
+
+Every URL, header, request body, field name, column position, fallback and
+bug-for-bug behaviour that affects the output format is kept as in the VBA.
+Where Python had to differ, a comment starts with  "PORT:".
+
+Keys (all four exist in the VBA and are NOT the same key):
+    riskdata_key     platform/riskdata/v1   (EP, stats, analyses, locations, location-aal)
+    riskmodeler_key  riskmodeler/v2         (RDS / ELT)
+    grouping_key     platform/grouping/v1   (+ its own x-rms-resource-group-id)
+    hazard_key       li/*                   (Location Intelligence hazard + geocode)
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Callable, NamedTuple
+from urllib.parse import quote
+
+import requests
+from requests.adapters import HTTPAdapter
+
+# --------------------------------------------------------------------------
+# Constants (identical to the VBA)
+# --------------------------------------------------------------------------
+RP_LIST = [10000, 5000, 1000, 500, 250, 200, 100, 50, 25, 10, 5, 2]
+EXPOSURE_TYPE = 8017
+RESP_SNIPPET_LEN = 300
+RDS_API_LIMIT = 1000
+TOPLOC_LIMIT = 10
+TOPLOC_PAGE_LIMIT = 1000
+LOC_PAGE_LIMIT = 1000
+SCAN_PAGES = 50
+SCAN_PAGE_SIZE = 100
+GROUP_NAME_MAXLEN = 64
+GROUP_POLL_MAX_ATTEMPTS = 360          # 1 hour at the UI's 10 s tick (VBA: 240 x 15 s)
+GROUP_POLL_SECONDS = 15                # MI_POLL_SECONDS (UI polls on its own timer)
+
+# RP_GetEventMap - order matters (it is the row order on 'RDS Events')
+EVENT_MAP = {
+    "2874165": "North East Windstorm",
+    "2867710": "Carolinas Windstorm",
+    "2848918": "Gulf of Mexico Windstorm",
+    "2865409": "Miami-Dade Windstorm",
+    "2869298": "Pinellas Windstorm",
+    "15022534": "Los Angeles EQ",
+    "15006191": "San Francisco EQ",
+    "15355285": "New Madrid RDS EQ",
+    "15631361": "PNW/BC EQ 100yr",
+    "15631695": "PNW/BC EQ 250yr",
+    "15623863": "PNW/BC EQ 500yr",
+    "15669240": "Quebec EQ 100yr",
+    "15675523": "Quebec EQ 250yr",
+    "15666680": "Quebec EQ 500yr",
+}
+
+# modLocationsHazard header list (37 columns) in exact display order
+LOC_HEADERS = [
+    "LocID", "Location Name", "Account Name", "Account Number",
+    "Location TIV", "Buildings TIV", "Contents TIV", "BI TIV", "EQSLINS",
+    "Construction Name", "Construction Scheme", "Construction Code",
+    "Occupancy Name", "Occupancy Scheme", "Occupancy Code",
+    "# of Stories", "Year Built", "User Text 1", "User Text 2", "User Defined 1", "User Defined 2",
+    "Country", "CRESTA", "Admin1", "Admin2", "Admin3", "City", "Admin4", "Postal Code", "Street Address",
+    "Latitude", "Longitude", "Geocoding Resolution", "Perils",
+    "Year Built Band", "Stories Band", "Lat,Long",
+]
+# Columns LH_AddHazardsForRowRange appends, in the order the VBA creates them
+# (flood columns sit in front of SubCresta, which is therefore the LAST column).
+HAZARD_HEADERS = [
+    "soilDescription", "liquefactionDescription", "landslideDescription",
+    "mmi100yr", "MMI_Description",
+    "floodZone", "floodDepthUndef100yr", "floodDepthDef100yr",
+    "floodDepthUndef500yr", "floodDepthDef500yr",
+    "floodScoreOverall", "floodScore100yr", "floodScore250yr", "floodScore500yr",
+    "SubCresta",
+]
+ALL_LOC_HEADERS = LOC_HEADERS + HAZARD_HEADERS
+
+STATE_NAME_TO_CODE = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+    "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA",
+    "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD", "Massachusetts": "MA",
+    "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO", "Montana": "MT",
+    "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM",
+    "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
+    "Virginia": "VA", "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
+    "District of Columbia": "DC",
+}
+STATE_CODE_TO_NAME = {v: k for k, v in STATE_NAME_TO_CODE.items()}
+MMI_DESC = {1: "Not Felt", 2: "Weak", 3: "Weak", 4: "Light", 5: "Moderate", 6: "Strong",
+            7: "Very Strong", 8: "Severe", 9: "Violent", 10: "Extreme", 11: "Extreme", 12: "Extreme"}
+
+# Grouping API  regionPerilSimulationSet  (verbatim from MI_CreateGroupingJob)
+REGION_PERIL_SIM_SET = [
+    {"perilCode": "WS", "regionCode": "NA", "modelRegionCode": "NAWS", "eventRateSchemeId": 578,
+     "simulationSetId": 131, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "CS", "regionCode": "NA", "modelRegionCode": "USCS", "eventRateSchemeId": 69,
+     "simulationSetId": 84, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "EQ", "regionCode": "NA", "modelRegionCode": "NAEQ", "eventRateSchemeId": 163,
+     "simulationSetId": 87, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "WT", "regionCode": "NA", "modelRegionCode": "NAWT", "eventRateSchemeId": 27,
+     "simulationSetId": 58, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "FL", "regionCode": "US", "modelRegionCode": "USFL", "eventRateSchemeId": 0,
+     "simulationSetId": 36, "simulationPeriods": 51200000, "engineVersion": "HDv1.2"},
+    {"perilCode": "WF", "regionCode": "NA", "modelRegionCode": "NAWF", "eventRateSchemeId": 0,
+     "simulationSetId": 53, "simulationPeriods": 102400000, "engineVersion": "HDv2.0"},
+    {"perilCode": "TR", "regionCode": "ZZ", "modelRegionCode": "ZZTR", "eventRateSchemeId": 0,
+     "simulationSetId": 46, "simulationPeriods": 2073776040, "engineVersion": "HDv1.0"},
+]
+
+Log = Callable[[str], None]
+
+
+def _noop(_msg: str) -> None:
+    pass
+
+
+# --------------------------------------------------------------------------
+# Credentials + HTTP
+# --------------------------------------------------------------------------
+def clean_key(k: str) -> str:
+    k = (k or "").strip()
+    return k[7:].strip() if k.lower().startswith("bearer ") else k
+
+
+@dataclass
+class Creds:
+    host: str
+    riskdata_key: str
+    riskmodeler_key: str
+    grouping_key: str = ""
+    hazard_key: str = ""
+    grouping_resource_group_id: str = ""
+    verify: bool = True
+
+    def __post_init__(self):
+        self.host = self.host.strip()
+        self.riskdata_key = clean_key(self.riskdata_key)
+        self.riskmodeler_key = clean_key(self.riskmodeler_key)
+        self.grouping_key = clean_key(self.grouping_key)
+        self.hazard_key = clean_key(self.hazard_key) or self.riskdata_key  # same value in the VBA
+        self.grouping_resource_group_id = (self.grouping_resource_group_id or "").strip()
+
+
+class Resp(NamedTuple):
+    status: int
+    text: str
+    headers: dict
+
+
+class Http:
+    """Thin requests wrapper. One instance per run; thread-safe for simple GET/POST."""
+
+    def __init__(self, verify: bool = True):
+        self.verify = verify
+        self.s = requests.Session()
+        ad = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        self.s.mount("https://", ad)
+        self.s.mount("http://", ad)
+        if not verify:
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+
+    def _do(self, method, url, key, body=None, headers=None, retries=3, timeout=(30, 120)):
+        h = {"Accept": "application/json", "Authorization": key}
+        if body is not None:
+            h["Content-Type"] = "application/json"
+        if headers:
+            h.update(headers)
+        last = ""
+        for attempt in range(retries):
+            try:
+                r = self.s.request(method, url, headers=h, timeout=timeout, verify=self.verify,
+                                   data=(body.encode("utf-8") if isinstance(body, str) else body))
+                if r.status_code in (429, 502, 503, 504) and attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+                    continue
+                return Resp(r.status_code, r.text, dict(r.headers))
+            except requests.RequestException as exc:
+                last = str(exc)
+                if attempt < retries - 1:
+                    time.sleep(min(2 ** (attempt + 1), 10))
+        return Resp(0, f"{method} error: {last}", {})
+
+    def get(self, url, key, headers=None):
+        return self._do("GET", url, key, headers=headers)
+
+    def post(self, url, key, body, headers=None):
+        return self._do("POST", url, key, body=body, headers=headers)
+
+
+# --------------------------------------------------------------------------
+# Small helpers (ports of RP_GetJ / MI_GetJ / LH_SafeGet / etc.)
+# --------------------------------------------------------------------------
+def _s(v) -> str:
+    """VBA CStr() for JSON scalars; '' for None / containers."""
+    if v is None or isinstance(v, (dict, list)):
+        return ""
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def gj(obj, key: str) -> str:
+    """RP_GetJ / MI_GetJ: string value of key (case-insensitive), '' if absent."""
+    if not isinstance(obj, dict):
+        return ""
+    if key in obj:
+        return _s(obj[key])
+    kl = key.lower()
+    for k, v in obj.items():
+        if str(k).lower() == kl:
+            return _s(v)
+    return ""
+
+
+def gv(obj, key: str):
+    """RP_GetV: raw value (case-insensitive) or None."""
+    if not isinstance(obj, dict):
+        return None
+    if key in obj:
+        return obj[key]
+    kl = key.lower()
+    for k, v in obj.items():
+        if str(k).lower() == kl:
+            return v
+    return None
+
+
+def gobj(obj, key: str) -> dict:
+    """RP_GetObjCI: sub-object (case-insensitive) or {}."""
+    v = gv(obj, key)
+    return v if isinstance(v, dict) else {}
+
+
+def to_num(v):
+    """String/number -> float or None (what Excel does when a numeric string is written)."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except ValueError:
+        return None
+
+
+def _is_numeric_str(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _rp_key(v) -> str:
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else str(f)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def extract_layer(analysis_name: str) -> str:
+    """RP_ExtractLayer: text after 'PORTFOLIO:' up to the first '_'."""
+    i = analysis_name.find("PORTFOLIO:")
+    t = analysis_name[i + len("PORTFOLIO:"):].strip() if i >= 0 else analysis_name
+    j = t.find("_")
+    return t[:j] if j >= 0 else t
+
+
+def strip_prefix(txt: str) -> str:
+    """LH_StripPrefix / RP_StripPrefix: '1 - Wood Frame' -> 'Wood Frame' (2nd segment only)."""
+    parts = txt.split(" - ")
+    return parts[1] if len(parts) >= 2 else txt
+
+
+def url_encode(s: str) -> str:
+    """MI_UrlEncode: RFC3986, only A-Za-z0-9 - . _ ~ left as is."""
+    return quote(s, safe="-._~")
+
+
+def limit64(s: str) -> str:
+    s = s.replace("\u2026", "").replace("...", "").strip()
+    return s[:GROUP_NAME_MAXLEN]
+
+
+def _as_list(parsed):
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for k in ("items", "analyses", "data", "results"):
+            if isinstance(parsed.get(k), list):
+                return parsed[k]
+    return []
+
+
+def _json(text: str):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Analysis meta / EP / stats   (MI_FetchOneAnalysis + RP_PullEpForAnalysis)
+# --------------------------------------------------------------------------
+def riskdata_base(c: Creds) -> str:
+    return f"https://{c.host}/platform/riskdata/v1"
+
+
+def fetch_meta(http: Http, c: Creds, analysis_id: str):
+    """GET platform/riskdata/v1/analyses/{id}; first element if a list; None on failure."""
+    r = http.get(f"{riskdata_base(c)}/analyses/{analysis_id}", c.riskdata_key)
+    if r.status != 200:
+        return None
+    p = _json(r.text)
+    if isinstance(p, list):
+        return p[0] if p and isinstance(p[0], dict) else None
+    return p if isinstance(p, dict) else None
+
+
+def parse_ep(text: str) -> dict:
+    """-> {'AEP': [12 values|None], 'OEP': [...]} aligned to RP_LIST."""
+    out = {}
+    data = _json(text)
+    if not isinstance(data, list):
+        return out
+    pos = {str(rp): i for i, rp in enumerate(RP_LIST)}
+    for curve in data:
+        ep_type = gj(curve, "epType")
+        val = gv(curve, "value")
+        rets = gv(val, "returnPeriods") if isinstance(val, dict) else None
+        vals = gv(val, "positionValues") if isinstance(val, dict) else None
+        if ep_type and isinstance(rets, list) and isinstance(vals, list):
+            arr = [None] * len(RP_LIST)
+            for j, rp in enumerate(rets):
+                k = pos.get(_rp_key(rp))
+                if k is not None and j < len(vals):
+                    arr[k] = vals[j]
+            out[ep_type] = arr
+    return out
+
+
+def parse_stats(text: str):
+    """-> (purePremium, stdDev, cv) as floats / None."""
+    p = _json(text)
+    s2 = p[0] if isinstance(p, list) and p else (p if isinstance(p, dict) else None)
+    if not isinstance(s2, dict):
+        return (None, None, None)
+    pp, sd, cv = gj(s2, "purePremium"), gj(s2, "totalStdDev"), gj(s2, "cv")
+    if not pp:
+        pp = gj(s2, "purePremiumAmount")
+    if not sd:
+        sd = gj(s2, "standardDeviation")
+    if not cv:
+        cv = gj(s2, "coefficientOfVariation")
+    return (to_num(pp), to_num(sd), to_num(cv))
+
+
+def currency_field(meta, key: str) -> str:
+    return gj(gobj(meta, "currency"), key)
+
+
+def fetch_analysis_data(http: Http, c: Creds, analysis_id: str,
+                        perspectives=("GU", "GR", "RL"), meta=None):
+    """Meta + EP + stats for one analysis. None if the meta fetch fails.
+    Result shape == MI_FetchOneAnalysis / MI_FetchManyAnalyses (+ a few Meta-sheet fields)."""
+    analysis_id = str(analysis_id)
+    if meta is None:
+        meta = fetch_meta(http, c, analysis_id)
+    if not meta:
+        return None
+    exp_type = gj(meta, "exposureResourceType") or str(EXPOSURE_TYPE)
+    exp_id = gj(meta, "exposureResourceId")
+    base = f"{riskdata_base(c)}/analyses/{analysis_id}"
+    jobs = []
+    for p in perspectives:
+        jobs.append((p, "ep", f"{base}/ep?exposureResourceType={exp_type}"
+                              f"&exposureResourceId={exp_id}&perspectiveCode={p}"))
+        jobs.append((p, "stats", f"{base}/stats?perspectiveCode={p}"
+                                 f"&exposureResourceId={exp_id}&exposureResourceType={exp_type}"))
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        resps = list(pool.map(lambda j: http.get(j[2], c.riskdata_key), jobs))
+    ep_dict, stats_dict = {}, {}
+    for (p, kind, _u), r in zip(jobs, resps):
+        if kind == "ep":
+            if r.status == 200 and r.text:
+                for ep_type, arr in parse_ep(r.text).items():
+                    ep_dict[f"{p}_{ep_type}"] = arr
+        else:
+            stats_dict[p] = parse_stats(r.text) if (r.status == 200 and r.text) else (None, None, None)
+    return {
+        "analysisId": analysis_id,
+        "appAnalysisId": gj(meta, "appAnalysisId"),
+        "portfolioName": gj(meta, "exposureName"),
+        "exposureType": exp_type,
+        "exposureID": exp_id,
+        "analysisName": gj(meta, "analysisName"),
+        "peril": gj(meta, "peril"),
+        "perilCode": gj(meta, "perilCode"),
+        "subPeril": gj(meta, "subPeril"),
+        "region": gj(meta, "region"),
+        "engineVersion": gj(meta, "engineVersion"),
+        "lossAmplification": gj(meta, "lossAmplification"),
+        "currencyCode": currency_field(meta, "currencyCode"),
+        "currencyName": currency_field(meta, "currencyName"),
+        "currencyVintage": currency_field(meta, "currencyVintage"),
+        "currencyAsOf": currency_field(meta, "asOfDate"),
+        "modelProfile": gj(gobj(meta, "modelProfile"), "name"),
+        "outputProfile": gj(gobj(meta, "outputProfile"), "name"),
+        "username": gj(meta, "username"),
+        "description": gj(meta, "description"),
+        "epDict": ep_dict,
+        "statsDict": stats_dict,
+    }
+
+
+def meta_row(d: dict) -> list:
+    """The 16 'Meta' columns exactly as RP_PullEpForAnalysis writes them."""
+    return [d["analysisId"], d["analysisName"], d.get("layer", ""), d["peril"], d["region"],
+            d["engineVersion"], d["lossAmplification"], d["currencyCode"], d["currencyName"],
+            d["currencyVintage"], d["modelProfile"], d["outputProfile"], d["username"],
+            d["portfolioName"], d["description"], f"https://api-euw1.rms.com/platform/riskdata/v1/analyses/{d['analysisId']}"]
+
+
+# --------------------------------------------------------------------------
+# Analysis-ID resolution
+# --------------------------------------------------------------------------
+def find_analysis_by_name(http: Http, c: Creds, name: str):
+    """MI_FindAnalysisIdByName, but returns the LATEST (highest analysisId) exact-name match
+    because re-running the same account re-uses the same analysis name.
+    -> {'analysisId','appAnalysisId','analysisName'} or None"""
+    filt = 'analysisName="' + name + '"'
+    url = f"{riskdata_base(c)}/analyses?filter={url_encode(filt)}&limit=100"
+    r = http.get(url, c.riskdata_key)
+    if r.status != 200:
+        return None
+    best = None
+    for it in _as_list(_json(r.text)):
+        aid = gj(it, "analysisId")
+        if aid.isdigit() and gj(it, "analysisName") == name:
+            if best is None or int(aid) > int(best["analysisId"]):
+                best = {"analysisId": aid, "appAnalysisId": gj(it, "appAnalysisId"), "analysisName": name}
+    return best
+
+
+def resolve_app_ids(http: Http, c: Creds, wanted: set) -> dict:
+    """MI_ResolveAppIdsBulk: page /analyses, map appAnalysisId -> analysisId."""
+    found = {}
+    for page in range(SCAN_PAGES):
+        url = f"{riskdata_base(c)}/analyses?offset={page * SCAN_PAGE_SIZE}&limit={SCAN_PAGE_SIZE}"
+        r = http.get(url, c.riskdata_key)
+        if r.status != 200:
+            break
+        items = _as_list(_json(r.text))
+        if not items:
+            break
+        for it in items:
+            app = gj(it, "appAnalysisId")
+            if app and app in wanted and app not in found:
+                found[app] = gj(it, "analysisId")
+        if all(w in found for w in wanted) or len(items) < SCAN_PAGE_SIZE:
+            break
+    return found
+
+
+def ids_from_workflow_text(text: str) -> list:
+    """Every plausible analysis id mentioned in a workflow/job response, in order."""
+    out = []
+
+    def add(v):
+        s = _s(v)
+        if s.isdigit() and s not in out:
+            out.append(s)
+
+    def walk(n):
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if str(k).lower() in ("analysisid", "appanalysisid"):
+                    add(v)
+                else:
+                    walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+        elif isinstance(n, str):
+            for m in re.findall(r"/analyses/(\d+)", n):
+                add(m)
+
+    p = _json(text or "")
+    if p is not None:
+        walk(p)
+    for m in re.findall(r"/analyses/(\d+)", text or ""):
+        add(m)
+    return out
+
+
+def resolve_quote_analysis(http: Http, c: Creds, edm_name: str, portfolio_name: str,
+                           workflow_text: str = "", manual_id: str = "", log: Log = _noop) -> dict:
+    """Find the just-run EQ analysis. Order: manual override -> exact analysisName
+    ('<EDM>: PORTFOLIO: <portfolio>') -> ids mentioned in the analysis workflow response."""
+    manual_id = (manual_id or "").strip()
+    if manual_id.isdigit():
+        meta = fetch_meta(http, c, manual_id)
+        if meta:
+            log(f"Using manual analysisId {manual_id}")
+            return {"analysisId": gj(meta, "analysisId") or manual_id,
+                    "appAnalysisId": gj(meta, "appAnalysisId"), "analysisName": gj(meta, "analysisName")}
+        scanned = resolve_app_ids(http, c, {manual_id})
+        if manual_id in scanned:
+            return {"analysisId": scanned[manual_id], "appAnalysisId": manual_id, "analysisName": ""}
+        raise RuntimeError(f"Manual analysis id {manual_id} could not be found in platform/riskdata/v1/analyses.")
+    name = f"{edm_name}: PORTFOLIO: {portfolio_name}"
+    hit = find_analysis_by_name(http, c, name)
+    if hit:
+        log(f"Resolved by analysisName '{name}' -> analysisId {hit['analysisId']} (app {hit['appAnalysisId'] or '?'})")
+        return hit
+    cands = ids_from_workflow_text(workflow_text)
+    log(f"No analysis named '{name}'. Workflow response mentions ids: {cands or 'none'}")
+    for cand in cands:
+        scanned = resolve_app_ids(http, c, {cand})
+        if cand in scanned:
+            return {"analysisId": scanned[cand], "appAnalysisId": cand, "analysisName": ""}
+        meta = fetch_meta(http, c, cand)
+        if meta and "PORTFOLIO:" in gj(meta, "analysisName"):
+            return {"analysisId": gj(meta, "analysisId") or cand,
+                    "appAnalysisId": gj(meta, "appAnalysisId"), "analysisName": gj(meta, "analysisName")}
+    raise RuntimeError(
+        f"Could not resolve the EQ analysis for '{name}'. Type the analysis id into the manual override box.")
+
+
+# --------------------------------------------------------------------------
+# RDS (riskmodeler/v2 ELT)   - RP_PullRdsForAnalysis
+# --------------------------------------------------------------------------
+def exposure_id_from_meta(js) -> str:
+    """RP_GetExposureIdFromMeta"""
+    v = gj(js, "exposureId")
+    if v:
+        return v
+    v = gj(gobj(js, "exposure"), "id")
+    if v:
+        return v
+    exps = gv(js, "exposures")
+    if isinstance(exps, list):
+        for it in exps:
+            v = gj(it, "id")
+            if v:
+                return v
+    return ""
+
+
+def pull_rds(http: Http, c: Creds, analysis_id: str, app_id: str, account: str, dbg: list):
+    """-> (layer, {eventid: rounded GR loss>0}). Appends the 'RDS Debug' rows to dbg."""
+    rds_id = app_id or analysis_id
+    meta_url = f"https://{c.host}/riskmodeler/v2/analyses/{rds_id}"
+    r = http.get(meta_url, c.riskmodeler_key)
+    meta = _json(r.text) if r.status == 200 else None
+    if isinstance(meta, list):
+        meta = meta[0] if meta else None
+    meta = meta if isinstance(meta, dict) else {}
+    name = gj(meta, "analysisName") or gj(meta, "name")
+    layer = extract_layer(name) if "PORTFOLIO:" in name.upper() else account
+    exp_id = exposure_id_from_meta(meta)
+    dbg.append([len(dbg) + 1, analysis_id, name, layer, "META", r.status, meta_url,
+                r.text[:RESP_SNIPPET_LEN], exp_id])
+    if not exp_id:
+        return layer, {}
+    ids_q = "&".join(f"eventIds={k}" for k in EVENT_MAP)
+    url = (f"https://{c.host}/riskmodeler/v2/analyses/{rds_id}/elt?limit={RDS_API_LIMIT}"
+           f"&exposureId={exp_id}&exposureType={EXPOSURE_TYPE}&perspective=GR&{ids_q}")
+    r2 = http.get(url, c.riskmodeler_key)
+    dbg.append([len(dbg) + 1, analysis_id, name, layer, "GR", r2.status, url,
+                r2.text[:RESP_SNIPPET_LEN], exp_id])
+    payload = _json(r2.text) if r2.status == 200 else None
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        payload = payload["items"]
+    sums = {}
+    if isinstance(payload, list):
+        for v in payload:
+            if isinstance(v, dict):
+                eid = gj(v, "eventid")
+                val = to_num(gv(v, "perspvalue")) or 0.0
+                if eid:
+                    sums[eid] = sums.get(eid, 0.0) + val
+    out = {}
+    for eid in EVENT_MAP:
+        loss = sums.get(eid, 0.0)
+        if loss > 0:
+            out[eid] = float(round(loss))      # VBA Round() == banker's rounding == Python round()
+    return layer, out
+
+
+# --------------------------------------------------------------------------
+# Locations (EDM) + Top Locations
+# --------------------------------------------------------------------------
+def fetch_all_locations(http: Http, c: Creds, exposure_id: str, log: Log = _noop) -> list:
+    """Page .../exposures/{id}/locations exactly like LH_Pull... / RP_BuildLocationDetailMap..."""
+    out, offset = [], 0
+    while True:
+        url = f"{riskdata_base(c)}/exposures/{exposure_id}/locations?limit={LOC_PAGE_LIMIT}&offset={offset}"
+        r = http.get(url, c.riskdata_key)
+        if r.status != 200:
+            log(f"locations fetch failed at offset {offset}: HTTP {r.status} {r.text[:200]}")
+            break
+        items = _json(r.text)
+        if not isinstance(items, list) or not items:
+            break
+        out.extend(items)
+        if len(items) < LOC_PAGE_LIMIT:
+            break
+        offset += LOC_PAGE_LIMIT
+        if offset > 200000:
+            break
+    return out
+
+
+def location_tiv_from_detail(http: Http, c: Creds, exposure_id: str, loc_id: str) -> float:
+    """RP_GetTivFromLocationDetail"""
+    if not loc_id:
+        return 0.0
+    r = http.get(f"{riskdata_base(c)}/exposures/{exposure_id}/locations/{loc_id}", c.riskdata_key)
+    if r.status != 200:
+        return 0.0
+    d = _json(r.text)
+    if not isinstance(d, dict):
+        return 0.0
+    bldg = to_num(d.get("maxCvgBldgValuation")) or 0.0
+    cont = bi = 0.0
+    for cov in d.get("locationCoverages") or []:
+        lt = gj(cov, "lossType").lower()
+        if lt == "contents":
+            cont = to_num(gv(cov, "value")) or 0.0
+        elif lt in ("bi", "business interruption"):
+            bi = to_num(gv(cov, "value")) or 0.0
+    return bldg + cont + bi
+
+
+def build_location_detail_map(all_locs: list) -> dict:
+    """RP_BuildLocationDetailMapForExposure: locationId -> 11-tuple."""
+    res = {}
+    for lw in all_locs:
+        if not isinstance(lw, dict):
+            continue
+        loc = gobj(lw, "location")
+        if not loc:
+            continue
+        prop, addr = gobj(loc, "property"), gobj(loc, "address")
+        lid = gj(prop, "locationId")
+        if not lid or lid in res:
+            continue
+        tiv = gv(lw, "tiv")
+        if to_num(tiv) is None:
+            tiv = gv(loc, "tiv")
+        tiv = to_num(tiv) or 0.0
+        res[lid] = (gj(prop, "locationName"), gj(prop, "locationNumber"), gj(addr, "streetAddress"),
+                    gj(addr, "cityName"), gj(addr, "postalCode"), gj(gobj(addr, "country"), "name"),
+                    strip_prefix(gj(gobj(prop, "occupancyType"), "name")),
+                    strip_prefix(gj(gobj(prop, "buildingClass"), "name")),
+                    gv(prop, "yearBuilt"), gv(prop, "stories"), tiv)
+    return res
+
+
+TOPLOC_HEADERS = ["Layer", "Analysis ID", "Rank", "Location ID", "Location Name", "Location Number",
+                  "Street Address", "City", "Postal Code", "Country", "Occupancy", "Building Class",
+                  "Year Built", "Stories", "Currency", "TIV", "AAL", "Std Dev", "CV"]
+
+
+def pull_top_locations(http: Http, c: Creds, analysis_id: str, account: str, edm_exposure_id: str,
+                       dbg: list, all_locs: list | None = None, log: Log = _noop):
+    """-> (layer, rows[19 cols] ). A 'no data' placeholder row mirrors the VBA."""
+    meta = fetch_meta(http, c, analysis_id)
+    if not meta:
+        dbg.append([len(dbg) + 1, analysis_id, "", "", "META", 0, f"{riskdata_base(c)}/analyses/{analysis_id}", "", ""])
+        return extract_layer(account), []
+    name = gj(meta, "analysisName")
+    exp_id = gj(meta, "exposureResourceId")
+    cur = gj(gobj(meta, "currency"), "currencyCode")
+    layer = extract_layer(name) if "PORTFOLIO:" in name.upper() else extract_layer(account)
+    dbg.append([len(dbg) + 1, analysis_id, name, layer, "META", 200, f"{riskdata_base(c)}/analyses/{analysis_id}", "", exp_id])
+    loc_exp = edm_exposure_id or exp_id
+    if not loc_exp:
+        return layer, [[layer, analysis_id, None, None, f"(no exposure ID resolved - see 'Top Locations Debug')"] + [None] * 14]
+    url = (f"{riskdata_base(c)}/analyses/{analysis_id}/location-aal?perspectiveCode=GR"
+           f"&sort=aal%20DESC&limit={TOPLOC_LIMIT}&offset=0")
+    r = http.get(url, c.riskdata_key)
+    dbg.append([len(dbg) + 1, analysis_id, name, layer, "AAL", r.status, url, r.text[:RESP_SNIPPET_LEN], exp_id])
+    aal = _json(r.text) if r.status == 200 else None
+    if not isinstance(aal, list):
+        return layer, [[layer, analysis_id, None, None,
+                        "(no Location AAL data returned - see 'Top Locations Debug')"] + [None] * 14]
+    if all_locs is None:
+        all_locs = fetch_all_locations(http, c, loc_exp, log)
+    dmap = build_location_detail_map(all_locs)
+    rows = []
+    for i, item in enumerate(aal[:TOPLOC_LIMIT], start=1):
+        lid = gj(item, "locationId")
+        row = [None] * 19
+        row[0], row[1], row[2], row[3] = layer, analysis_id, i, lid
+        row[4], row[5] = gj(item, "locationName"), gj(item, "locationNumber")
+        row[14] = cur
+        row[16], row[17], row[18] = gv(item, "aal"), gv(item, "stdDev"), gv(item, "cv")
+        det = dmap.get(lid)
+        if det:
+            if det[0]:
+                row[4] = det[0]
+            if det[1]:
+                row[5] = det[1]
+            row[6:14] = list(det[2:10])
+            tiv = det[10]
+            if tiv == 0:
+                tiv = location_tiv_from_detail(http, c, loc_exp, lid)
+            row[15] = tiv
+        rows.append(row)
+    return layer, rows
+
+
+# --------------------------------------------------------------------------
+# Locations + Hazard   (modLocationsHazard)
+# --------------------------------------------------------------------------
+def safe_get(obj, key: str, child: str | None = None):
+    """LH_SafeGet, bug-for-bug: '' -> 0, missing -> None (blank), missing parent -> 0."""
+    if not isinstance(obj, dict):
+        return 0
+
+    def leaf(d, k):
+        if k not in d:
+            return None
+        v = d[k]
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return 0 if v == "" else v
+        return v
+
+    if child is None:
+        return leaf(obj, key)
+    tmp = obj.get(key)
+    if not isinstance(tmp, dict):
+        return 0
+    return leaf(tmp, child)
+
+
+def _is_blank(v) -> bool:
+    """LH_IsBlankVal"""
+    if v is None:
+        return True
+    n = to_num(v)
+    if n is not None:
+        return n == 0
+    return len(str(v).strip()) == 0
+
+
+def proper_case(txt: str) -> str:
+    t = txt.strip()
+    if not t:
+        return ""
+    return " ".join(w[:1].upper() + w[1:] for w in t.lower().split(" ") if w != "")
+
+
+def get_cresta(addr: dict):
+    """LH_GetCresta"""
+    for k, ch in (("zone1", None), ("zone1Code", None), ("zone", "name"), ("zone", None),
+                  ("area", "name"), ("zone1", "name"), ("zone1Name", None), ("cresta", None)):
+        v = safe_get(addr, k, ch)
+        if not _is_blank(v):
+            return v
+    return safe_get(addr, "cresta")
+
+
+def get_admin1(addr: dict):
+    """LH_GetAdmin1"""
+    for k, ch in (("admin1Name", None), ("admin1", "name"), ("stateName", None), ("state", None)):
+        v = safe_get(addr, k, ch)
+        if not _is_blank(v):
+            return v
+    return safe_get(addr, "state")
+
+
+def resolve_eqsl_flag(detail) -> str:
+    """LH_GetEqslInsuranceObj + LH_ResolveEqslInsuranceFlag -> '1' / '0' / ''"""
+    obj = None
+    if isinstance(detail, dict):
+        eq = detail.get("locationEqDetail")
+        if isinstance(eq, dict) and isinstance(eq.get("eqslInsurance"), dict):
+            obj = eq["eqslInsurance"]
+        if obj is None:
+            def find(n):
+                if isinstance(n, dict):
+                    if isinstance(n.get("eqslInsurance"), dict):
+                        return n["eqslInsurance"]
+                    for v in n.values():
+                        r = find(v)
+                        if r is not None:
+                            return r
+                elif isinstance(n, list):
+                    for v in n:
+                        r = find(v)
+                        if r is not None:
+                            return r
+                return None
+            obj = find(detail)
+    if not isinstance(obj, dict):
+        return ""
+    combined = f"{gj(obj, 'code').strip().upper()}|{gj(obj, 'name').strip().upper()}"
+    if "YES" in combined:
+        return "1"
+    if "NO" in combined:
+        return "0"
+    return ""
+
+
+def year_band(y) -> str:
+    n = to_num(y)
+    if n is None:
+        return "Unknown"
+    if n == 9999:
+        return "Unknown"
+    if n >= 2020:
+        return "2020-2030"
+    if n >= 2010:
+        return "2010-2020"
+    if n >= 2000:
+        return "2000-2010"
+    if n >= 1990:
+        return "1990-2000"
+    return "Pre-1990"
+
+
+def stories_band(s):
+    n = to_num(s)
+    if n is None:
+        return "Unknown"
+    if n >= 50:
+        return "50+"          # PORT: VBA writes "'50+" - the leading ' is Excel's text prefix, not data
+    if n >= 21:
+        return "21-50"
+    if n >= 11:
+        return "11-20"
+    if n >= 7:
+        return "7-10"
+    return int(n) if float(n).is_integer() else n
+
+
+def _cstr(v) -> str:
+    return _s(v) if not isinstance(v, str) else v
+
+
+def build_location_row(lw: dict, detail, account: str, loc_fallback: dict) -> list:
+    """One 37-column Locations row (LH_PullLocationsAndHazardsForAccount inner loop)."""
+    loc = gobj(lw, "location")
+    prop, addr = gobj(loc, "property"), gobj(loc, "address")
+    o = [None] * 37
+    o[0] = safe_get(prop, "locationNumber")
+    o[1] = safe_get(prop, "locationName")
+    o[2] = account
+    o[3] = safe_get(prop, "accountId")
+    tiv = safe_get(lw, "tiv")
+    if tiv is None or tiv == "" or tiv == 0:
+        t2 = safe_get(loc, "tiv")
+        tiv = t2 if t2 is not None else tiv
+    o[4] = to_num(tiv) or 0.0
+    bldg = cont = bi = 0.0
+    eqsl = ""
+    if isinstance(detail, dict):
+        bldg = to_num(detail.get("maxCvgBldgValuation")) or 0.0
+        for cov in detail.get("locationCoverages") or []:
+            lt = gj(cov, "lossType").lower()
+            if lt == "contents":
+                cont = to_num(gv(cov, "value")) or cont
+            elif lt in ("bi", "business interruption"):
+                bi = to_num(gv(cov, "value")) or bi
+        eqsl = resolve_eqsl_flag(detail)
+    o[5], o[6], o[7], o[8] = bldg, cont, bi, eqsl
+    o[9] = strip_prefix(_cstr(safe_get(prop, "buildingClass", "name")))
+    o[10] = safe_get(prop, "buildingClassScheme", "name")
+    o[11] = safe_get(prop, "buildingClass", "code")
+    o[12] = strip_prefix(_cstr(safe_get(prop, "occupancyType", "name")))
+    o[13] = safe_get(prop, "occupancyTypeScheme", "name")
+    o[14] = safe_get(prop, "occupancyType", "id")
+    o[15] = safe_get(prop, "stories")
+    o[16] = safe_get(prop, "yearBuilt")
+    o[17] = safe_get(prop, "userText1")
+    o[18] = safe_get(prop, "userText2")
+    o[19] = safe_get(prop, "userId1")
+    o[20] = safe_get(prop, "userId2")
+    o[21] = safe_get(addr, "country", "name")
+    o[22] = get_cresta(addr)
+    o[23] = get_admin1(addr)
+    if _is_blank(o[23]):
+        key = f"{account.strip().upper()}|{_norm_locnum(o[0])}"
+        code = loc_fallback.get(key, "")
+        if code:
+            o[23] = STATE_CODE_TO_NAME.get(code, code)
+            if _is_blank(o[21]):
+                o[21] = "United States"
+    o[24] = safe_get(addr, "admin2Name")
+    o[25] = safe_get(addr, "admin3Name")
+    o[26] = safe_get(addr, "cityName")
+    o[27] = safe_get(addr, "admin4Name")
+    o[28] = _cstr(safe_get(addr, "postalCode"))      # PORT: kept as text so leading zeros survive
+    o[29] = safe_get(addr, "streetAddress")
+    o[30] = safe_get(addr, "latitude")
+    o[31] = safe_get(addr, "longitude")
+    o[32] = safe_get(addr, "geoResolutionCode", "name")
+    perils = prop.get("perils")
+    o[33] = ", ".join(str(p) for p in perils) if isinstance(perils, list) else ""
+    o[34] = year_band(o[16])
+    o[35] = stories_band(o[15])
+    o[36] = f"{_cstr(o[30])},{_cstr(o[31])}"
+    return o
+
+
+def _norm_locnum(v) -> str:
+    n = to_num(v)
+    return str(int(round(n))) if n is not None else str(v).strip()
+
+
+# ---- hazard calls ----------------------------------------------------------
+def _num_json(v) -> float:
+    n = to_num(v)
+    return n if n is not None else 0.0
+
+
+def _code(scheme, code) -> str:
+    """LH_Code: 'ATC7' style"""
+    sch = str(scheme or "").strip().upper()
+    cd = str(code or "").strip()
+    if sch in ("", "0"):
+        sch = "ATC"
+    if cd == "" or not _is_numeric_str(cd):
+        cd = "0"
+    else:
+        cd = str(int(float(cd))) if float(cd).is_integer() else cd
+    return sch + cd
+
+
+def _result_val(j, key):
+    """LH_ResultVal"""
+    if not isinstance(j, dict):
+        return "Error"
+    src = j
+    if key not in j and "results" in j:
+        res = j["results"]
+        if isinstance(res, list):
+            if res and isinstance(res[0], dict):
+                src = res[0]
+        elif isinstance(res, dict):
+            src = res
+    if key in src:
+        return "N/A" if src[key] is None else src[key]
+    if "code" in j or "message" in j:
+        return "Error"
+    return "N/A"
+
+
+def _flood_val(j, key):
+    """LH_FloodVal"""
+    if isinstance(j, dict) and key in j and j[key] is not None and str(j[key]) != "":
+        return j[key]
+    return "N/A"
+
+
+def _fema_zone(j) -> str:
+    """LH_FemaZone"""
+    if not isinstance(j, dict):
+        return "Error"
+    src = j
+    if "floodZone" not in j and "results" in j:
+        res = j["results"]
+        if isinstance(res, list):
+            if res and isinstance(res[0], dict):
+                src = res[0]
+        elif isinstance(res, dict):
+            src = res
+    if "floodZone" in src:
+        z = src["floodZone"]
+        return "Unmapped" if z is None or str(z).strip() == "" else str(z).strip()
+    return "Error"
+
+
+def hazard_lookups(http: Http, c: Creds, row: list) -> dict:
+    """LH_AddHazardsForRowRange for ONE row (37-col list). -> {hazard header: value} ('' skip)."""
+    out = {h: None for h in HAZARD_HEADERS}
+    country = _cstr(row[21])
+    if not country or country.upper() not in ("US", "UNITED STATES"):
+        return out
+    a1raw = _cstr(row[23]).strip()
+    code = STATE_NAME_TO_CODE.get(proper_case(a1raw), "")
+    if not code and len(a1raw) == 2 and a1raw.upper() in STATE_CODE_TO_NAME:
+        code = a1raw.upper()
+    lat, lon = row[30], row[31]
+    if not code or str(lat).strip() == "" or str(lon).strip() == "" or lat is None or lon is None:
+        return out
+    base = f"https://{c.host}/li"
+    key = c.hazard_key
+    addr = {"countryScheme": "ISO2A", "countryCode": "US", "latitude": lat, "longitude": lon,
+            "admin1Code": code, "countryRmsCode": "US", "rmsGeoModelResolutionCode": 1}
+
+    def post(path, body):
+        r = http.post(f"{base}/{path}/latest", key, json.dumps(body))
+        return _json(r.text), r.text
+
+    # EQ hazard
+    j, _ = post("na_eq_hazard", {"location": {"address": addr}})
+    if isinstance(j, dict):
+        out["soilDescription"] = j.get("soilDescription", "N/A")
+        out["liquefactionDescription"] = j.get("liquefactionDescription", "N/A")
+        out["landslideDescription"] = j.get("landslideDescription", "N/A")
+    else:
+        out["soilDescription"] = out["liquefactionDescription"] = out["landslideDescription"] = "Error"
+    # MMI
+    j, _ = post("us_mmi", {"location": {"address": addr}})
+    if isinstance(j, dict):
+        if "mmi100yr" in j:
+            mv = j["mmi100yr"]
+            out["mmi100yr"] = mv
+            n = to_num(mv)
+            out["MMI_Description"] = MMI_DESC.get(int(round(n)), "Unknown") if n is not None else "Unknown"
+        else:
+            out["mmi100yr"] = out["MMI_Description"] = "N/A"
+    else:
+        out["mmi100yr"] = out["MMI_Description"] = "Error"
+    # US flood depth
+    j, _ = post("us_fl_depth", {"location": {"address": addr, "characteristics": {}, "coverageValues": {}},
+                                "layerOptions": {"lookup": "floodDepth"}})
+    if isinstance(j, dict) and ("status" in j or "depthInlandUndef100yr" in j):
+        out["floodDepthUndef100yr"] = _flood_val(j, "depthInlandUndef100yr")
+        out["floodDepthDef100yr"] = _flood_val(j, "depthInlandDef100yr")
+        out["floodDepthUndef500yr"] = _flood_val(j, "depthInlandUndef500yr")
+        out["floodDepthDef500yr"] = _flood_val(j, "depthInlandDef500yr")
+    else:
+        for h in ("floodDepthUndef100yr", "floodDepthDef100yr", "floodDepthUndef500yr", "floodDepthDef500yr"):
+            out[h] = "Error"
+    # FEMA zone
+    j, _ = post("us_fema_firm", {"location": {"address": addr, "characteristics": {}, "coverageValues": {}}})
+    out["floodZone"] = _fema_zone(j)
+    # US flood risk score
+    chars = {"construction": _code(row[10], row[11]), "occupancy": _code(row[13], row[14]),
+             "yearBuilt": _num_json(row[16]), "numOfStories": _num_json(row[15])}
+    cov = {"buildingValue": _num_json(row[5]), "contentsValue": _num_json(row[6]),
+           "businessInterruptionValue": _num_json(row[7])}
+    j, _ = post("us_fl_risk_score", {"location": {"address": addr, "characteristics": chars, "coverageValues": cov}})
+    out["floodScoreOverall"] = _result_val(j, "scoreOverall")
+    out["floodScore100yr"] = _result_val(j, "score100yr")
+    out["floodScore250yr"] = _result_val(j, "score250yr")
+    out["floodScore500yr"] = _result_val(j, "score500yr")
+    # SubCresta (geocode zone1Code)
+    gb = {"countryScheme": "ISO2A", "countryCode": "US", "admin1Code": code,
+          "cityName": _cstr(row[26]).replace('"', "'"), "postalCode": _cstr(row[28]).replace('"', "'"),
+          "streetAddress": _cstr(row[29]).replace('"', "'")}
+    j, _ = post("geocode", gb)
+    if isinstance(j, dict):
+        z = safe_get(j, "zone1Code")
+        out["SubCresta"] = "N/A" if _is_blank(z) else _cstr(z)
+    else:
+        out["SubCresta"] = "Error"
+    return out
+
+
+def pull_locations_and_hazards(http: Http, c: Creds, exposure_id: str, account: str,
+                               loc_fallback: dict | None = None, do_hazard: bool = True,
+                               all_locs: list | None = None, log: Log = _noop, workers: int = 4):
+    """Port of LH_PullLocationsAndHazardsForAccount + hazards.
+    -> (rows [dict header->value], map_rows). Only the highest accountId is kept (VBA maxAcct)."""
+    loc_fallback = loc_fallback or {}
+    if all_locs is None:
+        all_locs = fetch_all_locations(http, c, exposure_id, log)
+    if not all_locs:
+        return [], []
+    max_acct = -1.0
+    for lw in all_locs:
+        n = to_num(safe_get(gobj(gobj(lw, "location"), "property"), "accountId"))
+        if n is not None and n > max_acct:
+            max_acct = n
+    keep = []
+    for lw in all_locs:
+        n = to_num(safe_get(gobj(gobj(lw, "location"), "property"), "accountId"))
+        if n is not None and n == max_acct:
+            keep.append(lw)
+    log(f"{len(all_locs)} location(s) in EDM; {len(keep)} match highest accountId={max_acct:g}")
+
+    def detail_for(lw):
+        lid = _s(safe_get(gobj(gobj(lw, "location"), "property"), "locationId"))
+        r = http.get(f"{riskdata_base(c)}/exposures/{exposure_id}/locations/{lid}", c.riskdata_key)
+        return _json(r.text) if r.status == 200 else None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        details = list(pool.map(detail_for, keep))
+    rows37 = [build_location_row(lw, d, account, loc_fallback) for lw, d in zip(keep, details)]
+    haz = [dict.fromkeys(HAZARD_HEADERS)] * len(rows37)
+    if do_hazard and rows37:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            haz = list(pool.map(lambda r: hazard_lookups(http, c, r), rows37))
+    rows = []
+    for r37, h in zip(rows37, haz):
+        d = dict(zip(LOC_HEADERS, r37))
+        d.update(h)
+        rows.append(d)
+    # Map sheet stats (LocID Count is never incremented in the VBA -> always 0)
+    stats, seen = {}, {}
+    for d in rows:
+        mk = f"{_cstr(d['Latitude'])},{_cstr(d['Longitude'])}"
+        if len(mk.strip()) > 1:
+            if mk not in stats:
+                stats[mk] = [d["Latitude"], d["Longitude"], mk, 0, 0.0]
+                seen[mk] = set()
+            lk = _cstr(d["LocID"])
+            if lk and lk not in seen[mk]:
+                seen[mk].add(lk)
+                stats[mk][4] += d["Location TIV"] or 0.0
+    return rows, list(stats.values())
+
+
+# --------------------------------------------------------------------------
+# Grouping API (Marginal Impact)   - MI_CreateGroupingJob / poll / extract
+# --------------------------------------------------------------------------
+def grouping_url(c: Creds) -> str:
+    return f"https://{c.host}/platform/grouping/v1/jobs"
+
+
+def _grouping_headers(c: Creds) -> dict:
+    return {"x-rms-resource-group-id": c.grouping_resource_group_id}
+
+
+def normalize_job_url(c: Creds, loc: str) -> str:
+    loc = (loc or "").strip()
+    if not loc:
+        return ""
+    if loc.lower().startswith("http"):
+        return loc
+    if loc.startswith("/"):
+        return f"https://{c.host}{loc}"
+    return f"https://{c.host}/{loc}"
+
+
+def create_grouping_job(http: Http, c: Creds, portfolio_aid: str, quote_aid: str, layer: str,
+                        cur_code: str, cur_vintage: str, cur_asof: str):
+    """-> (ok, job_url, raw, group_name)"""
+    group_name = limit64(f"MarginalImpact_{layer}_{portfolio_aid}_{quote_aid}")
+    descr = (f"Marginal impact of Quote {quote_aid} on Portfolio {portfolio_aid} (layer {layer})")
+    body = {
+        "resourceType": "analyses",
+        "resourceUris": [f"/platform/riskdata/v1/analyses/{portfolio_aid}",
+                         f"/platform/riskdata/v1/analyses/{quote_aid}"],
+        "settings": {
+            "analysisName": group_name, "description": descr,
+            "simulateToPLT": True, "propagateDetailedLosses": False, "numOfSimulations": 50000,
+            "currency": {"code": cur_code, "scheme": "RMS", "vintage": cur_vintage, "asOfDate": cur_asof},
+            "regionPerilSimulationSet": REGION_PERIL_SIM_SET,
+        },
+    }
+    bj = json.dumps(body, separators=(",", ":"))
+    r = http.post(grouping_url(c), c.grouping_key, bj, headers=_grouping_headers(c))
+    loc = r.headers.get("Location") or r.headers.get("location") or ""
+    raw = f"REQUEST: {bj}\nSTATUS: {r.status}\nRESPONSE: {r.text}\nLOCATION HEADER: {loc}"
+    if not (200 <= r.status < 300):
+        return False, "", raw, group_name
+    url = normalize_job_url(c, loc)
+    return bool(url), url, raw, group_name
+
+
+def poll_grouping_job(http: Http, c: Creds, job_url: str):
+    """One poll -> (status_word, raw_text). status_word in FINISHED/FAILED/CANCELLED/CANCELED or other."""
+    r = http.get(job_url, c.grouping_key, headers=_grouping_headers(c))
+    st = "UNKNOWN"
+    if r.status == 200:
+        p = _json(r.text)
+        if isinstance(p, dict) and "status" in p:
+            st = str(p["status"]).upper()
+    return st, r.text
+
+
+def extract_grouped_analysis_id(resp_text: str, exclude1: str, exclude2: str) -> str:
+    """MI_ExtractGroupedAnalysisId (last non-input numeric trailing segment wins)."""
+    best = ""
+    p = _json(resp_text)
+    res = gobj(p, "details").get("resources") if isinstance(p, dict) else None
+    if isinstance(res, list):
+        for it in res:
+            uri = gj(it, "uri")
+            if uri:
+                cand = uri.split("/")[-1].strip()
+                if cand.isdigit() and cand not in (exclude1, exclude2):
+                    best = cand
+    return best
+
+
+# --------------------------------------------------------------------------
+# Orchestration (non-Streamlit; the UI just calls these)
+# --------------------------------------------------------------------------
+def new_bundle() -> dict:
+    return {
+        "analyses": [],        # Results sheet entries
+        "meta_rows": [],       # 16-col rows
+        "rds_dbg": [],         # RDS Debug rows
+        "rds_cols": {},        # '<layer>_GR' -> {eventid: value}
+        "toploc_blocks": [],   # [(layer, rows)]
+        "toploc_dbg": [],
+        "locations": [],       # list of dicts (ALL_LOC_HEADERS)
+        "map_rows": [],
+        "mi": None,            # marginal impact dict
+        "layer_rows": [],      # report-summary layer rows
+        "notes": [],
+    }
+
+
+def pull_quote_stage(http: Http, c: Creds, ctx: dict, log: Log = _noop) -> dict:
+    """Everything that does NOT depend on the grouping job. Returns state for the grouping stage."""
+    bundle = new_bundle()
+    q = resolve_quote_analysis(http, c, ctx["edm_name"], ctx["portfolio_name"],
+                               ctx.get("workflow_text", ""), ctx.get("manual_quote_id", ""), log)
+    qid = q["analysisId"]
+    log(f"Quote (EQ) analysisId = {qid}")
+    qdata = fetch_analysis_data(http, c, qid)
+    if qdata is None:
+        raise RuntimeError(f"Could not fetch analysis meta for analysisId {qid}.")
+    layer = extract_layer(qdata["analysisName"]) if "PORTFOLIO:" in qdata["analysisName"].upper() \
+        else ctx["account_key"]
+    qdata["layer"] = layer
+    bundle["analyses"].append({"data": {k: qdata[k] for k in qdata if k not in ("epDict", "statsDict")} | {
+        "epDict": {k: v for k, v in qdata["epDict"].items() if k.startswith(("GU_", "GR_"))},
+        "statsDict": {k: v for k, v in qdata["statsDict"].items() if k in ("GU", "GR")}},
+        "layer": layer, "grouping_id": None})
+    bundle["meta_rows"].append(meta_row(qdata))
+    log(f"EP + stats pulled for layer {layer}")
+
+    app_id = q.get("appAnalysisId") or qdata.get("appAnalysisId") or ""
+    layer_rds, rds = pull_rds(http, c, qid, app_id, ctx["account_key"], bundle["rds_dbg"])
+    bundle["rds_cols"][f"{layer_rds}_GR"] = rds
+    log(f"RDS: {len(rds)} event(s) with GR loss > 0")
+
+    all_locs = None
+    if ctx.get("run_toploc") or ctx.get("run_locations"):
+        all_locs = fetch_all_locations(http, c, ctx["exposure_id"], log)
+    if ctx.get("run_toploc"):
+        lyr, rows = pull_top_locations(http, c, qid, ctx["account_key"], ctx["exposure_id"],
+                                       bundle["toploc_dbg"], all_locs, log)
+        bundle["toploc_blocks"].append((lyr, rows))
+        log(f"Top Locations: {len(rows)} row(s)")
+    if ctx.get("run_locations"):
+        rows, mp = pull_locations_and_hazards(http, c, ctx["exposure_id"], ctx["account_key"],
+                                              ctx.get("loc_fallback"), ctx.get("run_hazard", True),
+                                              all_locs, log)
+        bundle["locations"], bundle["map_rows"] = rows, mp
+        log(f"Locations: {len(rows)} row(s) (hazard lookups {'on' if ctx.get('run_hazard', True) else 'off'})")
+
+    state = {"stage": "done", "bundle": bundle, "layer": layer, "quote_id": qid, "quote_data": qdata,
+             "log": [], "group": None, "portfolio_data": None}
+
+    if ctx.get("run_mi"):
+        # in-force portfolio
+        pid = (ctx.get("inforce_long_id") or "").strip()
+        papp = (ctx.get("inforce_app_id") or "").strip()
+        if not pid.isdigit():
+            if not papp.isdigit():
+                raise RuntimeError("Marginal Impact needs the in-force Portfolio analysis id (Controls!A2).")
+            log(f"Resolving in-force app analysisId {papp} ...")
+            got = resolve_app_ids(http, c, {papp})
+            if papp not in got:
+                raise RuntimeError(f"Could not resolve in-force appAnalysisId {papp}; type the long analysisId "
+                                   f"(Controls!B2) into the override box.")
+            pid = got[papp]
+        if pid == qid:
+            raise RuntimeError("In-force Portfolio and Quote resolved to the SAME analysisId - check the in-force id.")
+        pdata = fetch_analysis_data(http, c, pid)
+        if pdata is None:
+            raise RuntimeError(f"Could not fetch EP/stats for the in-force Portfolio analysisId {pid}.")
+        pdata["layer"] = layer
+        log(f"In-force Portfolio analysisId = {pid}")
+        cur_code = pdata["currencyCode"] or "USD"
+        cur_vint = pdata["currencyVintage"] or "RL24"
+        cur_asof = pdata["currencyAsOf"] or "2024-04-03"
+        ok, url, raw, gname = create_grouping_job(http, c, pid, qid, layer, cur_code, cur_vint, cur_asof)
+        if not ok:
+            raise RuntimeError("Failed to create the Analysis Group (grouping job). " + raw[:600])
+        log(f"Grouping job submitted: {url}")
+        state.update(stage="grouping", portfolio_data=pdata)
+        state["group"] = {"job_url": url, "group_name": gname, "polls": 0, "status": "SUBMITTED",
+                          "last_resp": "", "portfolio_id": pid, "quote_id": qid, "group_id": ""}
+    return state
+
+
+def advance_grouping(http: Http, c: Creds, state: dict, log: Log = _noop) -> dict:
+    """One poll. On FINISHED: resolve the group id, fetch Quote/Grouped/Portfolio data, fill the
+    bundle's 'mi' block. Moves stage to 'done' or 'failed'."""
+    g = state["group"]
+    g["polls"] += 1
+    st, text = poll_grouping_job(http, c, g["job_url"])
+    g["status"], g["last_resp"] = st, text
+    log(f"Grouping status: {st}")
+    if st == "FINISHED":
+        gid = extract_grouped_analysis_id(text, g["portfolio_id"], g["quote_id"])
+        if not gid:
+            hit = find_analysis_by_name(http, c, g["group_name"])
+            gid = hit["analysisId"] if hit else ""
+        if not gid:
+            state["stage"] = "failed"
+            state["error"] = ("Grouping job FINISHED but the resulting group's analysisId could not be identified "
+                              f"(searched analysisName='{g['group_name']}'). Raw: {text[:500]}")
+            return state
+        g["group_id"] = gid
+        gdata = fetch_analysis_data(http, c, gid)
+        if gdata is None:
+            state["stage"] = "failed"
+            state["error"] = f"Grouping finished (group {gid}) but EP/stats fetch failed - no delta block written."
+            return state
+        gdata["layer"] = state["layer"]
+        state["bundle"]["mi"] = {"layer": state["layer"], "quote": state["quote_data"],
+                                 "portfolio": state["portfolio_data"], "grouped": gdata,
+                                 "quote_id": state["quote_id"], "portfolio_id": g["portfolio_id"], "group_id": gid}
+        # MI_AppendGroupedAnalysisToMeta: 16-col row, only the columns the VBA fills
+        row = [None] * 16
+        row[0], row[1], row[2], row[3] = gid, gdata["analysisName"], state["layer"], gdata["peril"]
+        row[4], row[5], row[6] = gdata["region"], gdata["engineVersion"], gdata["lossAmplification"]
+        row[7], row[8], row[9] = gdata["currencyCode"], gdata["currencyName"], gdata["currencyVintage"]
+        row[13] = gdata["portfolioName"]
+        row[15] = f"https://api-euw1.rms.com/platform/riskdata/v1/analyses/{gid}"
+        state["bundle"]["meta_rows"].append(row)
+        state["stage"] = "done"
+    elif st in ("FAILED", "CANCELLED", "CANCELED"):
+        state["stage"] = "failed"
+        state["error"] = f"Grouping job ended with status '{st}'. Raw: {text[:500]}"
+    elif g["polls"] >= GROUP_POLL_MAX_ATTEMPTS:
+        state["stage"] = "failed"
+        state["error"] = "Grouping job did not reach a terminal status within the polling limit."
+    return state
