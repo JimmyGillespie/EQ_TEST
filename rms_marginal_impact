@@ -1,0 +1,448 @@
+"""
+rms_marginal_impact.py
+======================
+Python port of the WORKING VBA module modMarginalImpact (Btn_RunMarginalImpact).
+No Streamlit dependency - import it from the app and call run().
+
+What it does (same flow as the VBA, same order):
+  1. Resolve appAnalysisId -> long analysisId (paged scan of /platform/riskdata/v1/analyses),
+     unless a long id is supplied.
+  2. PASS 1  POST /platform/grouping/v1/jobs for EVERY layer up front
+            (resourceUris = [Portfolio, Quote], full settings incl. currency + regionPerilSimulationSet)
+            -> 201 + Location header = job URL.
+  3. PASS 2  Poll all job URLs together until FINISHED / FAILED / CANCELLED.
+  4. PASS 3  Find the grouped analysisId (job details.resources[] -> fallback: search by analysisName),
+            fetch EP + stats (GU/GR/RL, AEP/OEP) for Quote, Portfolio, Grouped, and compute
+            Marginal = Grouped - Portfolio.
+
+CREDENTIALS - identical to the VBA:
+  * grouping calls  : grouping key (VBA: RMS_KEY_GROUPING) + grouping resource-group-id,
+                      Authorization header = the raw key (no "Bearer").
+  * everything else : risk-data key (VBA: RMS_KEY_RISKDATA), Authorization = raw key, no resource-group header.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+import requests
+
+# --------------------------------------------------------------------------- constants (match VBA)
+DEFAULT_HOST = "api-euw1.rms.com"
+RETURN_PERIODS = [10000, 5000, 1000, 500, 250, 200, 100, 50, 25, 10, 5, 2]   # MI_RP_LIST
+PERSPECTIVES = ["GU", "GR", "RL"]
+EP_TYPES = ["AEP", "OEP"]
+EXPOSURE_TYPE_DEFAULT = "8017"          # MI_EXPOSURE_TYPE
+GROUP_NAME_MAXLEN = 64                  # MI_GROUP_ANALYSISNAME_MAXLEN
+POLL_SECONDS = 15                       # MI_POLL_SECONDS
+POLL_MAX_ATTEMPTS = 240                 # MI_POLL_MAX_ATTEMPTS
+SCAN_PAGES = 50
+SCAN_PAGE_SIZE = 100
+
+# regionPerilSimulationSet - copied verbatim from MI_CreateGroupingJob
+REGION_PERIL_SET = [
+    {"perilCode": "WS", "regionCode": "NA", "modelRegionCode": "NAWS", "eventRateSchemeId": 578, "simulationSetId": 131, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "CS", "regionCode": "NA", "modelRegionCode": "USCS", "eventRateSchemeId": 69, "simulationSetId": 84, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "EQ", "regionCode": "NA", "modelRegionCode": "NAEQ", "eventRateSchemeId": 163, "simulationSetId": 87, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "WT", "regionCode": "NA", "modelRegionCode": "NAWT", "eventRateSchemeId": 27, "simulationSetId": 58, "simulationPeriods": 100000, "engineVersion": "RL24"},
+    {"perilCode": "FL", "regionCode": "US", "modelRegionCode": "USFL", "eventRateSchemeId": 0, "simulationSetId": 36, "simulationPeriods": 51200000, "engineVersion": "HDv1.2"},
+    {"perilCode": "WF", "regionCode": "NA", "modelRegionCode": "NAWF", "eventRateSchemeId": 0, "simulationSetId": 53, "simulationPeriods": 102400000, "engineVersion": "HDv2.0"},
+    {"perilCode": "TR", "regionCode": "ZZ", "modelRegionCode": "ZZTR", "eventRateSchemeId": 0, "simulationSetId": 46, "simulationPeriods": 2073776040, "engineVersion": "HDv1.0"},
+]
+
+
+# --------------------------------------------------------------------------- config / helpers
+def clean_key(k: str) -> str:
+    """Remove the things that silently break a pasted key: whitespace, line breaks, wrapping quotes."""
+    k = (k or "").strip().strip('"').strip("'").strip()
+    return re.sub(r"[\r\n\t]", "", k)
+
+
+@dataclass
+class RMSConfig:
+    risk_key: str                    # == VBA RMS_KEY_RISKDATA
+    grouping_key: str                # == VBA RMS_KEY_GROUPING
+    grouping_rg_id: str              # == VBA MI_GROUPING_RESOURCE_GROUP_ID
+    host: str = DEFAULT_HOST
+    verify_ssl: bool = True          # set False (or a CA path) behind the corporate proxy
+    timeout: int = 60
+
+    def __post_init__(self):
+        self.risk_key = clean_key(self.risk_key)
+        self.grouping_key = clean_key(self.grouping_key)
+        self.grouping_rg_id = (self.grouping_rg_id or "").strip()
+        self.host = re.sub(r"^https?://", "", (self.host or DEFAULT_HOST).strip()).rstrip("/")
+
+    @property
+    def base(self) -> str:
+        return f"https://{self.host}"
+
+
+def limit64(s: str) -> str:
+    """MI_Limit64"""
+    s = s.replace("\u2026", "").replace("...", "").strip()
+    return s[:GROUP_NAME_MAXLEN]
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------- results containers
+@dataclass
+class AnalysisData:
+    analysis_id: str
+    meta: dict = field(default_factory=dict)
+    ep: Dict[Tuple[str, str], Dict[int, float]] = field(default_factory=dict)       # (persp, epType) -> {rp: loss}
+    stats: Dict[str, dict] = field(default_factory=dict)                            # persp -> {pure_premium, std_dev, cv}
+
+    @property
+    def name(self): return self.meta.get("analysisName", "")
+    @property
+    def peril_code(self): return self.meta.get("perilCode", "")
+
+
+@dataclass
+class LayerResult:
+    layer: str
+    quote_id: str = ""
+    status: str = ""                 # OK / SKIPPED / SUBMIT_FAILED / FAILED / TIMEOUT / NO_GROUP_ID / ...
+    message: str = ""
+    job_url: str = ""
+    group_name: str = ""
+    group_id: str = ""
+    last_resp: str = ""
+    quote: Optional[AnalysisData] = None
+    grouped: Optional[AnalysisData] = None
+    marginal: Dict[Tuple[str, str], dict] = field(default_factory=dict)   # (persp, epType) -> {"rp":{..}, "pure_premium", "std_dev", "cv"}
+
+
+# --------------------------------------------------------------------------- the client
+class MarginalImpact:
+    def __init__(self, cfg: RMSConfig, progress: Optional[Callable[[int, str], None]] = None,
+                 is_cancelled: Optional[Callable[[], bool]] = None, session: Optional[requests.Session] = None):
+        self.cfg = cfg
+        self.progress = progress or (lambda pct, msg: None)
+        self.is_cancelled = is_cancelled or (lambda: False)
+        self.s = session or requests.Session()
+
+    # ---- HTTP (VBA: MI_HttpGet / MI_PostJsonGrouping / MI_HttpGetGrouping) ----
+    def _risk_headers(self):
+        return {"Accept": "application/json", "Authorization": self.cfg.risk_key}
+
+    def _grp_headers(self, post=False):
+        h = {"Accept": "application/json", "Authorization": self.cfg.grouping_key,
+             "x-rms-resource-group-id": self.cfg.grouping_rg_id}
+        if post:
+            h["Content-Type"] = "application/json"
+        return h
+
+    def _get(self, url, headers):
+        try:
+            r = self.s.get(url, headers=headers, timeout=self.cfg.timeout, verify=self.cfg.verify_ssl)
+            return r.status_code, r.text, r
+        except requests.RequestException as e:
+            return 0, f"GET error: {e}", None
+
+    def _risk_json(self, path_or_url):
+        url = path_or_url if path_or_url.startswith("http") else self.cfg.base + path_or_url
+        code, text, _ = self._get(url, self._risk_headers())
+        if code != 200:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if isinstance(data, list):
+            return data[0] if data else None        # MI_FetchJson returns parsed(1)
+        return data
+
+    # ---- credential pre-flight (use this BEFORE submitting anything) ----
+    def check_grouping_auth(self) -> Tuple[bool, str]:
+        """GET on the grouping endpoint with the grouping key. 401 => the key is not accepted."""
+        code, text, _ = self._get(f"{self.cfg.base}/platform/grouping/v1/jobs?limit=1", self._grp_headers())
+        k = self.cfg.grouping_key
+        fp = f"key length={len(k)}, resource-group={self.cfg.grouping_rg_id[:8]}..., host={self.cfg.host}"
+        if code == 401:
+            return False, f"401 Unauthorized - grouping key rejected ({fp}). Re-copy RMS_KEY_GROUPING from the VBA."
+        if code == 403:
+            return False, f"403 Forbidden - key valid but not allowed for this resource group ({fp})."
+        if code == 0:
+            return False, text
+        return True, f"Grouping credentials accepted (HTTP {code}; {fp})."
+
+    # ---- Step 1: appAnalysisId -> long analysisId (MI_ResolveAppIdsBulk) ----
+    def resolve_app_ids(self, app_ids: List[str]) -> Dict[str, str]:
+        need = {str(a).strip() for a in app_ids if str(a).strip()}
+        found: Dict[str, str] = {}
+        for page in range(SCAN_PAGES):
+            url = f"{self.cfg.base}/platform/riskdata/v1/analyses?offset={page * SCAN_PAGE_SIZE}&limit={SCAN_PAGE_SIZE}"
+            code, text, r = self._get(url, self._risk_headers())
+            if code != 200:
+                break
+            items = r.json()
+            if not isinstance(items, list) or not items:
+                break
+            for it in items:
+                a = str(it.get("appAnalysisId", "") or "")
+                if a in need and a not in found:
+                    found[a] = str(it.get("analysisId", ""))
+            if need <= set(found) or len(items) < SCAN_PAGE_SIZE:
+                break
+        return found
+
+    # ---- Step 2: create grouping job (MI_CreateGroupingJob) ----
+    def build_grouping_body(self, portfolio_id: str, quote_id: str, layer: str,
+                            cur_code="USD", cur_vintage="RL24", cur_asof="2024-04-03") -> Tuple[dict, str]:
+        group_name = limit64(f"MarginalImpact_{layer}_{portfolio_id}_{quote_id}")
+        body = {
+            "resourceType": "analyses",
+            "resourceUris": [f"/platform/riskdata/v1/analyses/{portfolio_id}",
+                             f"/platform/riskdata/v1/analyses/{quote_id}"],
+            "settings": {
+                "analysisName": group_name,
+                "description": f"Marginal impact of Quote {quote_id} on Portfolio {portfolio_id} (layer {layer})",
+                "simulateToPLT": True,
+                "propagateDetailedLosses": False,
+                "numOfSimulations": 50000,
+                "currency": {"code": cur_code, "scheme": "RMS", "vintage": cur_vintage, "asOfDate": cur_asof},
+                "regionPerilSimulationSet": REGION_PERIL_SET,
+            },
+        }
+        return body, group_name
+
+    def create_grouping_job(self, body: dict) -> Tuple[bool, str, str]:
+        """returns (ok, job_url, raw_text)"""
+        try:
+            r = self.s.post(f"{self.cfg.base}/platform/grouping/v1/jobs", headers=self._grp_headers(post=True),
+                            json=body, timeout=120, verify=self.cfg.verify_ssl)
+        except requests.RequestException as e:
+            return False, "", f"POST error: {e}"
+        raw = f"STATUS {r.status_code}\nRESPONSE {r.text}\nLOCATION {r.headers.get('Location', '')}"
+        if not (200 <= r.status_code < 300):
+            return False, "", raw
+        return True, self._normalize_job_url(r.headers.get("Location", "")), raw
+
+    def _normalize_job_url(self, loc: str) -> str:
+        loc = (loc or "").strip()
+        if not loc:
+            return ""
+        if loc.lower().startswith("http"):
+            return loc
+        return f"{self.cfg.base}{loc if loc.startswith('/') else '/' + loc}"
+
+    # ---- Step 3b: group id (MI_ExtractGroupedAnalysisId / MI_FindAnalysisIdByName) ----
+    @staticmethod
+    def extract_group_id(resp_text: str, exclude: List[str]) -> str:
+        try:
+            parsed = json.loads(resp_text)
+        except Exception:
+            return ""
+        best = ""
+        res = (parsed.get("details") or {}).get("resources") if isinstance(parsed, dict) else None
+        for it in res or []:
+            tail = str(it.get("uri", "")).rstrip("/").split("/")[-1]
+            if tail.isdigit() and tail not in exclude:
+                best = tail
+        return best
+
+    def find_analysis_id_by_name(self, group_name: str) -> str:
+        flt = urllib.parse.quote(f'analysisName="{group_name}"', safe="-._~")
+        code, text, r = self._get(f"{self.cfg.base}/platform/riskdata/v1/analyses?filter={flt}&limit=5", self._risk_headers())
+        if code != 200:
+            return ""
+        items = r.json()
+        return str(items[0].get("analysisId", "")) if isinstance(items, list) and items else ""
+
+    # ---- Step 4: EP + stats (MI_FetchManyAnalyses) ----
+    def fetch_analyses(self, ids: List[str]) -> Dict[str, AnalysisData]:
+        metas = {i: self._risk_json(f"/platform/riskdata/v1/analyses/{i}") for i in ids}
+        jobs = []
+        for i, m in metas.items():
+            if not m:
+                continue
+            et = str(m.get("exposureResourceType") or EXPOSURE_TYPE_DEFAULT)
+            eid = str(m.get("exposureResourceId") or "")
+            for p in PERSPECTIVES:
+                jobs.append((i, p, "ep", f"{self.cfg.base}/platform/riskdata/v1/analyses/{i}/ep?exposureResourceType={et}&exposureResourceId={eid}&perspectiveCode={p}"))
+                jobs.append((i, p, "stats", f"{self.cfg.base}/platform/riskdata/v1/analyses/{i}/stats?perspectiveCode={p}&exposureResourceId={eid}&exposureResourceType={et}"))
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            got = list(ex.map(lambda j: (j, self._get(j[3], self._risk_headers())), jobs))
+
+        out = {i: AnalysisData(i, meta=m) for i, m in metas.items() if m}
+        for (i, p, kind, _), (code, text, r) in got:
+            if code != 200 or not text:
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                continue
+            ad = out[i]
+            if kind == "ep":
+                for curve in data if isinstance(data, list) else []:
+                    et = curve.get("epType")
+                    v = curve.get("value") or {}
+                    rps, vals = v.get("returnPeriods") or [], v.get("positionValues") or []
+                    if et and rps and vals:
+                        ad.ep[(p, et)] = {int(rp): vals[n] for n, rp in enumerate(rps)
+                                          if int(rp) in RETURN_PERIODS and n < len(vals)}
+            else:
+                s = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else {}
+                ad.stats[p] = {
+                    "pure_premium": s.get("purePremium", s.get("purePremiumAmount")),
+                    "std_dev": s.get("totalStdDev", s.get("standardDeviation")),
+                    "cv": s.get("cv", s.get("coefficientOfVariation")),
+                }
+        return out
+
+    @staticmethod
+    def compute_marginal(grouped: AnalysisData, portfolio: AnalysisData) -> dict:
+        """MI_WriteMarginalBlock: Grouped minus Portfolio, per perspective / EP type."""
+        out = {}
+        for p in PERSPECTIVES:
+            for et in EP_TYPES:
+                g, b = grouped.ep.get((p, et)), portfolio.ep.get((p, et))
+                if g is None or b is None:
+                    continue
+                rp = {r: g[r] - b[r] for r in RETURN_PERIODS
+                      if _num(g.get(r)) is not None and _num(b.get(r)) is not None}
+                gs, bs = grouped.stats.get(p, {}), portfolio.stats.get(p, {})
+                row = {"rp": rp}
+                for k in ("pure_premium", "std_dev", "cv"):
+                    a, c = _num(gs.get(k)), _num(bs.get(k))
+                    row[k] = (a - c) if a is not None and c is not None else None
+                out[(p, et)] = row
+        return out
+
+    # ---- orchestration (Btn_RunMarginalImpact) ----
+    def run(self, portfolio_id: str, quotes: List[dict],
+            portfolio_is_app_id: bool = True) -> Tuple[Optional[AnalysisData], List[LayerResult]]:
+        """
+        quotes: [{"layer": "Layer1", "id": "<appAnalysisId or long analysisId>", "is_app_id": True/False}, ...]
+        Returns (portfolio AnalysisData, [LayerResult per layer, same order]).
+        """
+        ok, msg = self.check_grouping_auth()
+        if not ok:
+            return None, [LayerResult(layer=q.get("layer", ""), status="AUTH_FAILED", message=msg) for q in quotes]
+
+        # resolve ids
+        need = ([portfolio_id] if portfolio_is_app_id else []) + [q["id"] for q in quotes if q.get("is_app_id", True)]
+        self.progress(5, f"Resolving {len(need)} appAnalysisId(s)...")
+        resolved = self.resolve_app_ids(need) if need else {}
+        pid = resolved.get(str(portfolio_id), "") if portfolio_is_app_id else str(portfolio_id)
+        if not pid:
+            return None, [LayerResult(layer=q.get("layer", ""), status="SKIPPED",
+                                      message=f"Could not resolve portfolio id '{portfolio_id}'") for q in quotes]
+
+        self.progress(10, "Fetching Portfolio (in-force) EP/stats...")
+        pdata = self.fetch_analyses([pid]).get(pid)
+        if not pdata:
+            return None, [LayerResult(layer=q.get("layer", ""), status="SKIPPED",
+                                      message=f"Could not fetch EP/stats for Portfolio {pid}") for q in quotes]
+
+        cur = (pdata.meta.get("currency") or {})
+        code = cur.get("currencyCode") or "USD"
+        vint = cur.get("currencyVintage") or "RL24"
+        asof = cur.get("asOfDate") or "2024-04-03"
+
+        # PASS 1 - submit every layer
+        results: List[LayerResult] = []
+        for n, q in enumerate(quotes, 1):
+            layer = q.get("layer") or f"Layer{n}"
+            qid = resolved.get(str(q["id"]), "") if q.get("is_app_id", True) else str(q["id"])
+            lr = LayerResult(layer=layer, quote_id=qid)
+            results.append(lr)
+            self.progress(15 + int(20 * n / len(quotes)), f"Submitting grouping job for '{layer}' ({n}/{len(quotes)})...")
+            if self.is_cancelled():
+                lr.status, lr.message = "SKIPPED", "cancelled before submission"
+                continue
+            if not qid.isdigit():
+                lr.status, lr.message = "SKIPPED", f"could not resolve '{q['id']}' to an analysisId"
+                continue
+            if qid == pid:
+                lr.status, lr.message = "SKIPPED", "Quote analysisId equals the Portfolio analysisId"
+                continue
+            body, lr.group_name = self.build_grouping_body(pid, qid, layer, code, vint, asof)
+            ok, url, raw = self.create_grouping_job(body)
+            if not ok or not url:
+                lr.status, lr.message = "SUBMIT_FAILED", raw[:400]
+                continue
+            lr.job_url, lr.status = url, "SUBMITTED"
+
+        # PASS 2 - poll all together
+        for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
+            pending = [r for r in results if r.status == "SUBMITTED"]
+            if not pending:
+                break
+            if self.is_cancelled():
+                for r in pending:
+                    r.status, r.message = "CANCELLED_BY_USER", "job keeps running in RMS; result not collected"
+                break
+            self.progress(35 + int(30 * (1 - len(pending) / max(1, len(results)))),
+                          f"Polling {len(pending)} grouping job(s) (round {attempt})...")
+            for r in pending:
+                code_, text, _ = self._get(r.job_url, self._grp_headers())
+                r.last_resp = text
+                st = "UNKNOWN"
+                if code_ == 200:
+                    try:
+                        st = str(json.loads(text).get("status", "UNKNOWN")).upper()
+                    except Exception:
+                        pass
+                if st in ("FINISHED", "FAILED", "CANCELLED", "CANCELED"):
+                    r.status = st
+            if any(r.status == "SUBMITTED" for r in results):
+                time.sleep(POLL_SECONDS)
+        for r in results:
+            if r.status == "SUBMITTED":
+                r.status = "TIMEOUT"
+                r.message = f"no terminal status after {POLL_MAX_ATTEMPTS * POLL_SECONDS}s"
+
+        # PASS 3a - grouped analysisId
+        self.progress(70, "Identifying resulting Grouped analysisId(s)...")
+        for r in results:
+            if r.status == "FINISHED":
+                r.group_id = (self.extract_group_id(r.last_resp, [pid, r.quote_id])
+                              or self.find_analysis_id_by_name(r.group_name))
+                if not r.group_id:
+                    r.status, r.message = "NO_GROUP_ID", f"no group found for analysisName='{r.group_name}'. Raw: {r.last_resp[:300]}"
+
+        # PASS 3b - one batch fetch
+        want = sorted({x for r in results if r.status == "FINISHED" for x in (r.quote_id, r.group_id)})
+        self.progress(75, f"Pulling Quote + Grouped EP/stats for {len(want)} analyses...")
+        fetched = self.fetch_analyses(want) if want else {}
+
+        # PASS 3c - assemble
+        for r in results:
+            if r.status != "FINISHED":
+                if not r.message:
+                    r.message = f"grouping job ended with status {r.status}. Raw: {r.last_resp[:300]}"
+                continue
+            r.quote, r.grouped = fetched.get(r.quote_id), fetched.get(r.group_id)
+            if r.grouped is None:
+                r.status, r.message = "FETCH_FAILED", "grouping finished but EP/stats fetch failed"
+                continue
+            r.marginal = self.compute_marginal(r.grouped, pdata)
+            r.status = "OK"
+        self.progress(100, "Done")
+        return pdata, results
+
+
+# --------------------------------------------------------------------------- convenience for the UI
+def marginal_dataframe(result: LayerResult, perspective="RL", ep_type="AEP"):
+    """Return a small pandas DataFrame (Return period, Quote, Portfolio, Grouped, Marginal) - needs the
+    portfolio AnalysisData passed in as part of `result.portfolio_ref` by the caller if wanted; here we
+    only return the marginal column, which is what the Results screen needs."""
+    import pandas as pd
+    m = result.marginal.get((perspective, ep_type))
+    if not m:
+        return pd.DataFrame(columns=["Return period", "Marginal impact"])
+    return pd.DataFrame({"Return period": list(m["rp"].keys()), "Marginal impact": list(m["rp"].values())})
