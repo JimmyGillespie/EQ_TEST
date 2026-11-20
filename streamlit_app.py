@@ -1795,9 +1795,10 @@ def safe_num(v, default=0):
 
 
 def safe_year(v):
-    """YEARBUILT / YEARUPGRAD must be a plain 4-digit year integer - NOT a date string."""
+    """Convert a YYYY user input to the RMS MRI date format: 1/1/YYYY."""
     n = safe_num(v, 0)
-    return int(n) if n > 1752 else ""
+    year = int(n) if n > 1752 else 0
+    return f"1/1/{year}" if year else ""
 
 
 def build_acc_row(account):
