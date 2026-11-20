@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "locale": "English_United Kingdom.1252",
+  "metadata": {
+    "appmode": "python-streamlit",
+    "entrypoint": "streamlit_app"
+  },
+  "python": {
+    "version": "3.11.2",
+    "package_manager": {
+      "name": "pip",
+      "version": "21.3.1",
+      "package_file": "requirements.txt"
+    }
+  },
+  "files": {
+    "requirements.txt": {
+      "checksum": "4b5d819c1e6cf508bf77225567e17385"
+    },
+    ".gitignore": {
+      "checksum": "8e152c186294686576d9efd50d5bc7ad"
+    },
+    "LICENSE": {
+      "checksum": "86d3f3a95c324c9479bd8986968f4327"
+    },
+    "README.md": {
+      "checksum": "29fa0c3160fcc29c4f6333aec57eb39e"
+    },
+    "streamlit_app.py": {
+      "checksum": "17d4640e52174772c667b0acabb69dae"
+    }
+  }
+}
