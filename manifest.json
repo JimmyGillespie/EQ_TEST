@@ -6,7 +6,7 @@
     "entrypoint": "streamlit_app"
   },
   "python": {
-    "version": "3.11.2",
+    "version": "3.11.9",
     "package_manager": {
       "name": "pip",
       "version": "21.3.1",
@@ -29,5 +29,8 @@
     "streamlit_app.py": {
       "checksum": "17d4640e52174772c667b0acabb69dae"
     }
+  },
+  "environment": {
+    "image": "amtprdacrk8s01.azurecr.io/content-pro-krb-r4.3.1-p3.11.9-q1.5.57-ubuntu2204:posit-connect-pkg-resources-fix.latest"
   }
 }
