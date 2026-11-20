@@ -9,7 +9,8 @@ are embedded below as compressed text and registered as normal Python modules at
 uploading. Each module loads on its own, so a problem in one can never take down the rest of the app.
 
 Keys can live in Streamlit Secrets / environment variables (LI_API_KEY, RISKDATA_API_KEY, GROUPING_API_KEY,
-INFORCE_ANALYSIS_ID, RMS_HOST). The quote library is stored in STORE_DIR (default: a folder in the home directory).
+INFORCE_ANALYSIS_ID, RMS_HOST). The quote library is stored in STORE_DIR (default: a folder in the home directory); every account run is also saved to a
+timestamped folder under /mnt/from-posit/content/anv-eq-rms-modeller/ (local fallback if that mount is unavailable).
 """
 import base64
 import hashlib
@@ -33,7 +34,7 @@ import traceback as _tb
 import types as _types
 import zlib as _zlib
 
-BUILD_ID = "v12-quote-desk"
+BUILD_ID = "v13-quote-desk"
 
 _BUNDLED_MODULES = [
     ("rms_preflight", """
@@ -522,40 +523,60 @@ PnObOpH7lpEGfCJoXnlPLNaTKGk7Cbhfjkx6HMpR9a53fqLyVdqOQQR+39YQPG46D0Iea52zej0DrsbG
 H02qsMY=
 """),
     ("anv_store", """
-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
+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
 """),
     ("rms_results_ui", """
 eNrdfdt227iy4Lu/Aoe9ckwmtCL5FkdpZcZJnHRWO3G27XTv3j5eXBQJSWxTJENSvrTH53E+YH5mv+9PmS+ZqgJAAiQlO9nJy2R1WxIIFAqFQlWhUAValr
@@ -1795,10 +1816,10 @@ def safe_num(v, default=0):
 
 
 def safe_year(v):
-    """Convert a YYYY user input to the RMS MRI date format: 1/1/YYYY."""
+    """Input is a 4-digit year (YYYY); RMS wants a date, so 2012 -> "1/1/2012". Blank/invalid -> "1/1/9999"."""
     n = safe_num(v, 0)
     year = int(n) if n > 1752 else 0
-    return f"1/1/{year}" if year else ""
+    return f"1/1/{year}" if year else "1/1/9999"
 
 
 def build_acc_row(account):
@@ -2273,11 +2294,34 @@ def _get_store(folder: str):
 
 STORE = _get_store(_secret("STORE_DIR"))
 
+
+@st.cache_resource(show_spinner=False)
+def _get_archive(share_dir: str, local_dir: str):
+    """Timestamped run folders: the Posit output share when it is writable, else a local folder."""
+    return _anv_store.Archive(share_dir or None, local_dir)
+
+
+ARCHIVE = _get_archive(_secret("ARCHIVE_DIR"), str(STORE.path.parent / "runs"))
+
+
+@st.cache_resource(show_spinner=False)
+def _auto_restore(_store, _archive):
+    """Once per server start: if the library is empty and the shared folder holds earlier runs, load them back."""
+    try:
+        if not _store.list() and _archive.on_share:
+            return _store.restore_from_archive(_archive)
+    except Exception:                                    # noqa: BLE001
+        pass
+    return (0, 0)
+
+
+_auto_restore(STORE, ARCHIVE)
+
 SECTION_STEPS = ["1 · Quote", "2 · Geocode", "3 · RMS run", "4 · Results"]
 S_QUOTE, S_GEO, S_RUN, S_RES = SECTION_STEPS
 WS_KEYS = ["acc_df", "loc_df", "preview_rows", "geo_failed", "geo_coarse", "rms_import_job", "verify_result",
            "verify_override", "pipeline_state", "res_state", "res_error", "preflight_issues", "auto_pull",
-           "launch_error", "allow_ungeocoded", "import_log"]
+           "launch_error", "allow_ungeocoded", "import_log", "run_stamp", "arch_hash"]
 
 
 def _qp_id(value: str = "") -> None:
@@ -2378,17 +2422,37 @@ def _save(include_results: bool = False, status: str | None = None) -> str | Non
     if "acc_df" in ss and "loc_df" in ss:
         files = {"acc_csv": ss["acc_df"].to_csv(index=False), "loc_csv": ss["loc_df"].to_csv(index=False),
                  "preview_rows": ss.get("preview_rows", [])}
+    stamp = ss.get("run_stamp")
+    if files is not None and key and not stamp:
+        stamp = ss["run_stamp"] = ARCHIVE.new_stamp()          # a new account run starts here
     run = None
-    if job or ps:
+    if job or ps or stamp:
         run = _anv_store.strip_secrets({"job": job, "pipeline": ps, "verify": ss.get("verify_result"),
-                                        "verify_override": ss.get("verify_override", False)})
+                                        "verify_override": ss.get("verify_override", False), "archive": stamp})
     results = _anv_store.strip_secrets(done_state) if (include_results and done_state) else None
     ss["acct_id"] = STORE.upsert(
         ss.get("acct_id") or "", account_key=key, layer=acct.get("Layer Name", ""),
         edm_name=(job or {}).get("edm_name", ""), status=status or _derive_status(), summary=summary,
         inputs=draft, files=files, run=run, results=results)
     _qp_id(ss["acct_id"])
+    _archive_run(ss["acct_id"], stamp, files, run, results, status or _derive_status(), draft)
     return ss["acct_id"]
+
+
+def _archive_run(acct_id, stamp, files, run, results, status, draft) -> None:
+    """Mirror the saved account into its timestamped run folder. Skipped if nothing changed; never raises."""
+    if not (acct_id and stamp and files is not None):
+        return
+    try:
+        sig = hashlib.md5(_anv_store.pack([files, run, results, status, draft])).hexdigest()
+        if ss.get("arch_hash") == (stamp, sig):
+            return
+        if not ARCHIVE.on_share:
+            ARCHIVE.refresh()                                   # pick the share up again if it has come back
+        if STORE.archive_run(ARCHIVE, acct_id, stamp) is not None:
+            ss["arch_hash"] = (stamp, sig)
+    except Exception:                                           # noqa: BLE001  (saving to the library still worked)
+        pass
 
 
 def _reset_workspace() -> None:
@@ -2425,6 +2489,8 @@ def _open_account(acct_id: str) -> bool:
         failed, coarse = geocode_quality(ss["preview_rows"])
         ss["geo_failed"], ss["geo_coarse"] = failed, coarse
     run = rec.get("run") or {}
+    if run.get("archive"):
+        ss["run_stamp"] = run["archive"]
     if run.get("job"):
         ss["rms_import_job"] = run["job"]
     if run.get("pipeline"):
@@ -2552,8 +2618,11 @@ with st.sidebar:
                     "(environment variables) or the same names in `.streamlit/secrets.toml`.")
         st.code('LI_API_KEY = "..."\nRISKDATA_API_KEY = "..."\nGROUPING_API_KEY = "..."\n'
                 '# optional\nINFORCE_ANALYSIS_ID = "65418"\nRMS_HOST = "api-euw1.rms.com"\n'
-                'STORE_DIR = "/path/that/persists"', language="toml")
+                'STORE_DIR = "/path/that/persists"\n'
+                'ARCHIVE_DIR = "/mnt/from-posit/content/anv-eq-rms-modeller"   # default, only set to override',
+                language="toml")
     st.caption(f"Library: {len(STORE.list())} account(s)")
+    st.caption("Run folders: shared folder" if ARCHIVE.on_share else "Run folders: LOCAL fallback (shared folder not available)")
 
 
 # --------------------------------------------------------------------------
@@ -2660,8 +2729,15 @@ def _library_view():
             _load_from_rms(edm_in, acct_in)
 
     with st.expander("Backup and restore"):
-        st.caption(f"The library is stored on the app server ({STORE.path}). If the app is redeployed to a fresh "
-                   "server it can start empty - keep a backup, or set STORE_DIR to a folder that persists.")
+        st.caption(f"The library database is on the app server ({STORE.path}). Every run is also saved to a "
+                   f"timestamped folder: {ARCHIVE.label}.")
+        if st.button("Restore library from the run folders", key="bk_arch", disabled=not ARCHIVE.on_share,
+                     help="Reads the saved run folders back into the library. Newer copies win."):
+            try:
+                added, updated = STORE.restore_from_archive(ARCHIVE)
+                st.success(f"Restored from run folders: {added} added, {updated} updated.")
+            except Exception as exc:                          # noqa: BLE001
+                st.error(f"Could not restore: {exc}")
         b1, b2 = st.columns(2)
         b1.download_button("Download library backup", data=STORE.export_all(), width="stretch",
                            file_name=f"ANV_quote_library_{datetime.now():%Y%m%d_%H%M}.json", mime="application/json",
@@ -3064,8 +3140,9 @@ def _run_import(edm_name: str, account_key: str) -> None:
             bar_stop("Import job submission failed")
             return
         log(f"Import job submitted (jobId {job_id})")
-        for k in ("verify_result", "pipeline_state", "res_state", "verify_override", "launch_error"):
-            ss.pop(k, None)
+        for k in ("verify_result", "pipeline_state", "res_state", "verify_override", "launch_error",
+                  "run_stamp", "arch_hash"):
+            ss.pop(k, None)                                     # a new import job is a new run -> new folder
         if ss.get("acct_id"):
             STORE.clear_part(ss["acct_id"], "results")
         ss["rms_import_job"] = {"job_id": job_id, "exposure_id": exposure_id, "portfolio_id": portfolio_id,
