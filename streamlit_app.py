@@ -1649,7 +1649,12 @@ class RmsImportApi:
         parsed = self._safe_json(text)
         st_value = ""
         if isinstance(parsed, dict):
-            st_value = str(parsed.get("status") or parsed.get("jobStatus") or "").upper()
+            for _k in ("status", "jobStatus", "state", "workflowStatus"):
+                if parsed.get(_k):
+                    st_value = str(parsed.get(_k)).strip().upper()
+                    break
+            if not st_value and isinstance(parsed.get("job"), dict):
+                st_value = str(parsed["job"].get("status") or "").strip().upper()
         return (st_value or "UNKNOWN"), status_url, text
 
 
@@ -2245,6 +2250,9 @@ div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 8px; }
 @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(31,74,117,.5);} 70%{box-shadow:0 0 0 9px rgba(31,74,117,0);} 100%{box-shadow:0 0 0 0 rgba(31,74,117,0);} }
 .legend { font-size:.78rem; opacity:.8; margin: 4px 0 10px; }
 .legend span { display:inline-block; width:10px; height:10px; border-radius:50%; margin: 0 5px 0 14px; vertical-align:-1px; }
+[data-testid="stProgressBarTrack"] { background-color: rgba(128,128,128,.22) !important; border-radius: 4px; overflow: hidden; }
+[data-testid="stProgressBarTrack"] > div { background-color: #14304D !important; border-radius: 4px; }
+[data-testid="stProgress"] p { font-size: .84rem; opacity: .8; }
 """
 
 st.markdown(f"<style>{APP_CSS}{_RES_CSS}</style>", unsafe_allow_html=True)
@@ -2921,11 +2929,87 @@ def _step_geocode():
 
 
 # ---- Step 3: RMS run -------------------------------------------------------------
+import math as _math
+
+
+def _edm_eta(elapsed: float) -> float:
+    """Estimated share (0-1) of the EDM build done after `elapsed` seconds. Eases toward ~97%, never reaches 100%
+    until RMS confirms the EDM - so the bar keeps moving but never claims to be finished early."""
+    return min(0.97, 1.0 - _math.exp(-max(elapsed, 0.0) / 100.0))
+
+
+def _edm_with_progress(rms_api, edm_name: str, tick):
+    """Same result as rms_api.get_or_create_edm(), but ticks once a second so a progress bar can move smoothly.
+    Returns (exposure_id, diagnostic_message); exposure_id is '' on failure."""
+    eid = rms_api.resolve_exposure_id(edm_name)
+    if eid:
+        return eid, ""
+    url = (f"https://{rms_api.host}/riskmodeler/v1/datasources"
+           f"?datasourcename={quote(edm_name)}&operation=CREATE")
+    status, text, _h = rms_api._post(url, "")
+    if status != 409 and not (200 <= status < 300):
+        return "", (f"EDM CREATE request was rejected by RMS.\nURL: {url}\n"
+                    f"HTTP status: {status}\nResponse: {text}")
+    limit = RMS_EDM_WAIT_ATTEMPTS * RMS_EDM_WAIT_SECONDS
+    t0 = time.time()
+    last_check = 0.0
+    while True:
+        elapsed = time.time() - t0
+        tick(elapsed)
+        if elapsed - last_check >= RMS_EDM_WAIT_SECONDS:
+            last_check = elapsed
+            eid = rms_api.resolve_exposure_id(edm_name)
+            if eid:
+                return eid, ""
+        if elapsed > limit:
+            break
+        time.sleep(1)
+    return "", (f"RMS accepted the EDM create request (HTTP {status}), but the EDM never became findable. "
+                f"Waited {int(limit)}s for '{edm_name}'.\nCreate response: {text}")
+
+
+_IMP_OK = ("COMPLETED", "COMPLETE", "SUCCESS", "SUCCEEDED", "FINISHED", "DONE")
+_IMP_BAD = ("FAILED", "ERROR", "CANCELLED", "CANCELED")
+
+
+def _refresh_import(job) -> None:
+    """One status check. If RMS reports no recognisable end state, fall back to what is actually in RMS:
+    if every location is already there, the import is finished."""
+    api = RmsImportApi(rms_import_host, rms_import_api_key, verify=rms_import_verify_ssl)
+    status, url, raw = api.check_job_status_once(job["job_id"], cached_status_url=job.get("status_url", ""))
+    job["status_url"] = url
+    ss["import_seen"] = status
+    if status in _IMP_OK:
+        job["import_status"] = "COMPLETED"
+    elif status in _IMP_BAD:
+        job["import_status"] = "FAILED"
+        ss["import_log"] = (raw or "")[:1500]
+    elif "loc_df" in ss and job.get("portfolio_id"):
+        try:
+            verifier = ImportVerifier(rms_import_host, rms_import_api_key, verify=rms_import_verify_ssl)
+            res = verify_location_count(verifier, job["exposure_id"], job["portfolio_id"], len(ss["loc_df"]))
+            if res.get("match") and not res.get("error"):
+                job["import_status"] = "COMPLETED"
+                ss["import_seen"] = f"{status} (locations confirmed in RMS)"
+        except Exception:                                           # noqa: BLE001
+            pass
+
+
 def _run_import(edm_name: str, account_key: str) -> None:
     """Create/resolve the EDM, make the portfolio, upload both files, submit the MRI import and poll it."""
     acc_bytes = ss["acc_df"].to_csv(index=False).encode("utf-8")
     loc_bytes = ss["loc_df"].to_csv(index=False).encode("utf-8")
     rms_api = RmsImportApi(rms_import_host.strip(), rms_import_api_key, verify=rms_import_verify_ssl)
+    st.caption("Keep this page open while RMS builds the database - it usually takes a few minutes.")
+    bar = st.progress(0.01, text="Starting import")
+    _bar_last = [0.01]
+
+    def bar_set(frac, text):
+        _bar_last[0] = min(max(frac, 0.0), 1.0)
+        bar.progress(_bar_last[0], text=text)
+
+    def bar_stop(text):
+        bar.progress(_bar_last[0], text=text)
     box = st.status("Starting import...", expanded=True)
     lines = []
 
@@ -2934,25 +3018,33 @@ def _run_import(edm_name: str, account_key: str) -> None:
         box.write(msg)
     try:
         box.update(label="Resolving or creating the EDM...")
+        def tick(elapsed):
+            mins, secs = divmod(int(elapsed), 60)
+            bar_set(0.02 + 0.68 * _edm_eta(elapsed), f"Building the EDM in RMS  -  {mins}:{secs:02d} elapsed")
         log(f"Resolving EDM '{edm_name}'...")
 
         def wait_cb(attempt, total, name):
             box.update(label=f"Waiting for EDM '{name}' to build... ({attempt}/{total})")
-        exposure_id, diag = rms_api.get_or_create_edm(edm_name, wait_callback=wait_cb)
+        exposure_id, diag = _edm_with_progress(rms_api, edm_name, tick)
         if not exposure_id:
             log(f"Failed to resolve or create the EDM.\n{diag}")
             box.update(label="EDM creation failed", state="error")
+            bar_stop("EDM creation failed")
             return
         log(f"EDM confirmed (exposureId {exposure_id})")
+        bar_set(0.70, "EDM ready")
         box.update(label="Creating the portfolio...")
+        bar_set(0.73, "Creating the portfolio")
         portfolio_id = rms_api.ensure_portfolio_by_identifier(exposure_id, account_key)
         log(f"Portfolio ready (portfolioId {portfolio_id})" if portfolio_id
             else "Could not create or resolve a portfolio - the import would target the EDM directly.")
         box.update(label="Uploading the files...")
+        bar_set(0.79, "Uploading the ACC and LOC files")
         folder_ok, folder_id, acc_upload, loc_upload = rms_api.create_import_folder()
         if not folder_ok:
             log("Failed to create the import folder.")
             box.update(label="Import folder creation failed", state="error")
+            bar_stop("Import folder creation failed")
             return
         acc_ok, acc_err = rms_api.upload_file_to_s3(acc_upload, acc_bytes)
         log(f"ACC upload: {'OK' if acc_ok else acc_err}")
@@ -2960,12 +3052,15 @@ def _run_import(edm_name: str, account_key: str) -> None:
         log(f"LOC upload: {'OK' if loc_ok else loc_err}")
         if not (acc_ok and loc_ok):
             box.update(label="File upload failed", state="error")
+            bar_stop("File upload failed")
             return
         box.update(label="Submitting the import job...")
+        bar_set(0.86, "Submitting the import job")
         job_id, raw = rms_api.submit_import_job(folder_id, exposure_id, portfolio_id, currency="USD")
         if not job_id:
             log(f"Import job submission failed.\nRaw response: {raw[:500]}")
             box.update(label="Import job submission failed", state="error")
+            bar_stop("Import job submission failed")
             return
         log(f"Import job submitted (jobId {job_id})")
         for k in ("verify_result", "pipeline_state", "res_state", "verify_override", "launch_error"):
@@ -2976,20 +3071,24 @@ def _run_import(edm_name: str, account_key: str) -> None:
                                 "edm_name": edm_name, "status_url": "", "import_status": "RUNNING"}
         _save()
         box.update(label="Waiting for the import to finish...")
+        bar_set(0.88, "Waiting for RMS to finish the import")
         final, status_url = "UNKNOWN", ""
         for i in range(1, 13):
             time.sleep(5)
             final, status_url, _raw = rms_api.check_job_status_once(job_id, cached_status_url=status_url)
             log(f"Import status {i}/12: {final}")
-            if final in ("COMPLETED", "SUCCESS", "SUCCEEDED", "FAILED", "ERROR"):
+            bar_set(0.88 + 0.12 * i / 12, f"Waiting for RMS to finish the import  -  check {i} of 12")
+            if final in _IMP_OK or final in _IMP_BAD:
                 break
         ss["rms_import_job"]["status_url"] = status_url
-        if final in ("COMPLETED", "SUCCESS", "SUCCEEDED"):
+        if final in _IMP_OK:
             ss["rms_import_job"]["import_status"] = "COMPLETED"
             box.update(label="Import complete", state="complete")
-        elif final in ("FAILED", "ERROR"):
+            bar_set(1.0, "Import complete")
+        elif final in _IMP_BAD:
             ss["rms_import_job"]["import_status"] = "FAILED"
             box.update(label="Import failed", state="error")
+            bar_stop("Import failed in RMS")
         else:
             log("Still running - use 'Check import status' below.")
             box.update(label=f"Import still running ({final})", state="running")
@@ -3110,18 +3209,24 @@ def _step_run():
     # ---- a job exists: drive it forward ----
     imp = job.get("import_status", "")
     if imp == "RUNNING":
-        st.info(f"Import job {job['job_id']} is still running in RMS.")
-        if st.button("Check import status", type="primary", key="chk_imp"):
-            api = RmsImportApi(rms_import_host, rms_import_api_key, verify=rms_import_verify_ssl)
-            status, url, raw = api.check_job_status_once(job["job_id"], cached_status_url=job.get("status_url", ""))
-            job["status_url"] = url
-            if status in ("COMPLETED", "SUCCESS", "SUCCEEDED"):
+        @st.fragment(run_every="5s")
+        def _imp_watch():
+            if not rms_import_api_key:
+                st.warning("Add the Risk Data key in the sidebar so the import can be checked.")
+                return
+            _refresh_import(job)
+            if job.get("import_status") != "RUNNING":
+                _save()
+                st.rerun()
+            st.info(f"Import job {job['job_id']} - RMS reports: {ss.get('import_seen') or 'no status yet'}. "
+                    "Checking automatically every 5 seconds.")
+        _imp_watch()
+        with st.expander("Import looks finished in RMS but this has not moved?"):
+            st.caption("Marks the import complete. The next step still confirms every location is present.")
+            if st.button("Treat the import as complete", key="imp_force"):
                 job["import_status"] = "COMPLETED"
-            elif status in ("FAILED", "ERROR"):
-                job["import_status"] = "FAILED"
-                ss["import_log"] = raw[:1500]
-            _save()
-            st.rerun()
+                _save()
+                st.rerun()
     elif imp == "FAILED":
         st.error("The import job failed in RMS.")
         if ss.get("import_log"):
